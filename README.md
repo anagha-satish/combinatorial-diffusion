@@ -1,4 +1,4 @@
-# Combinatorial restless bandits
+# Combinatorial Mirror-Descent Diffusion
 
 This code implements and evaluates algorithms for the paper [**Reinforcement learning with combinatorial actions for coupled restless bandits**](https://arxiv.org/abs/2503.01919) by Lily Xu, Bryan Wilder, Elias B. Khalil, and Milind Tambe which appeared at the International Conference on Learning Representations (ICLR 2025). In this paper we consider reinforcement learning (RL) with combinatorial actions, specifically for restless bandits.
 

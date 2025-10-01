@@ -7,7 +7,7 @@ Similar to bipartite matching.
 
 import random
 import numpy as np
-import gym
+import gymnasium as gym
 
 import gurobipy as gp
 from gurobipy import GRB

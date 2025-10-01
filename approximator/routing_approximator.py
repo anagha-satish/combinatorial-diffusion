@@ -17,6 +17,37 @@ class RoutingRmabApproximator(StandardRmabApproximator):
         super().__init__(rmab, model_type)
         self.action_dim = rmab.n_arms
 
+    def _ensure_cached_model(self, with_combinatorial: bool = True):
+
+        if getattr(self, "_model", None) is None:
+            model = self.get_master_mip(with_combinatorial=with_combinatorial)
+            self._to_pull = [model.getVarByName(f"action_{j}") for j in range(self.rmab.n_arms)]
+            self._model = model
+
+            self._model.setParam("OutputFlag", 0)
+
+    def _set_linear_objective_from_coeffs(self, c: np.ndarray):
+        assert getattr(self, "_model", None) is not None, "Call _ensure_cached_model() first."
+        assert len(c) == self.rmab.n_arms
+        expr = gp.quicksum(float(c[j]) * self._to_pull[j] for j in range(self.rmab.n_arms))
+        self._model.setObjective(expr, GRB.MAXIMIZE)
+
+    def solve_from_coeffs(self, c: np.ndarray) -> np.ndarray:
+
+        self._ensure_cached_model(with_combinatorial=True)
+        self._set_linear_objective_from_coeffs(c)
+
+        self._model.optimize()
+
+        x = np.array([int(round(v.X)) for v in self._to_pull], dtype=np.int32)
+
+        if x.sum() > self.rmab.budget:
+            idx = np.argsort(c)[::-1]
+            keep = np.zeros_like(x)
+            keep[idx[: self.rmab.budget]] = 1
+            x = keep.astype(np.int32)
+
+        return x
 
     def get_master_mip(self, with_combinatorial=False):
         """

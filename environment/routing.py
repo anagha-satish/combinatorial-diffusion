@@ -170,7 +170,10 @@ class RoutingRMAB(StandardRMAB):
     def get_approximator(self):
         """ get MIP approximator with action constraints """
         return RoutingRmabApproximator
-            
+    
+    def solve_from_coeffs(self, c: np.ndarray) -> np.ndarray:
+        approximator = RoutingRmabApproximator(self)
+        return approximator.solve(c)
 
 
 class TorchRoutingRMAB(RoutingRMAB):
