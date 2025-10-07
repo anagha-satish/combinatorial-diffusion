@@ -1,10 +1,10 @@
-# algos/dpmd_experiment.py
+# algos/dpmd_experiment_rf.py
 from __future__ import annotations
 from typing import Callable, List, Tuple
 import numpy as np
 import torch
-from algos.dpmd import DPMD, DPMDConfig, Experience
-from models.ddpm.service import ddpm_service as actor_service
+from algos.dpmd_rf import DPMD, DPMDConfig, Experience
+from models.rfm.service import rfm_service
 
 def _reset_obs(env):
     out = env.reset()
@@ -22,8 +22,8 @@ def _flat(x) -> np.ndarray:
 
 def build_dpmd(obs_dim: int, act_dim: int, *, seed: int = 0, num_particles: int = 8) -> DPMD:
     torch.manual_seed(seed); np.random.seed(seed)
-    actor_service.init(obs_dim=obs_dim, act_dim=act_dim, lr=1e-4, seed=seed, T=50, force=True)
-    cfg = DPMDConfig(num_particles=num_particles, target_J=4, lambda_temp=1.0, w_clip=50.0)
+    rfm_service.init(obs_dim=obs_dim, act_dim=act_dim, lr=1e-4, seed=seed, force=True)
+    cfg = DPMDConfig(num_particles=num_particles)
     return DPMD(obs_dim=obs_dim, act_dim=act_dim, cfg=cfg)
 
 def collect_one_traj(env, learner: DPMD, horizon: int,
@@ -55,10 +55,13 @@ def train_one_step(learner: DPMD,
 
     def _to_B(vec: np.ndarray) -> np.ndarray:
         arr = np.asarray(vec, dtype=np.float32)
+        # Make [B, ...]
         if arr.ndim == 0:
             return np.full((B,), float(arr), dtype=np.float32)
         if arr.ndim == 1:
+            # Already [B]
             return arr[:B]
+        # Flatten trailing dims and take the first element per row
         arr2 = arr.reshape(arr.shape[0], -1)
         if arr2.shape[0] != B:
             arr2 = arr2[:B] if arr2.shape[0] > B else np.pad(arr2, ((0, B - arr2.shape[0]), (0, 0)))
@@ -101,7 +104,7 @@ def run_dpmd_only(env, t_env, horizon: int, budget: int, n_episodes_eval: int,
 
     learner = build_dpmd(obs_dim, act_dim, seed=seed, num_particles=8)
 
-    # --- warmup with random trajectories using RFM sampler ---
+    # --- warmup with random trajectories (using the current RFM sampler anyway) ---
     from algos.replay_buffer import ReplayBuffer
     buffer = ReplayBuffer(capacity=100_000, obs_dim=obs_dim, act_dim=act_dim)
 
@@ -121,6 +124,7 @@ def run_dpmd_only(env, t_env, horizon: int, budget: int, n_episodes_eval: int,
     rewards_all: List[float] = []
     for _ in range(n_episodes_eval):
         traj, _ = collect_one_traj(env, learner, horizon, linear_solver, K=learner.cfg.num_particles)
+        # pad to fixed horizon
         traj += [(None, None, 0.0, None, 1.0)] * (horizon - len(traj))
         rewards_all.extend([t[2] for t in traj])
 

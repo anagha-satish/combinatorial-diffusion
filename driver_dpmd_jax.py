@@ -1,15 +1,12 @@
-# driver_dpmd.py
 import os, argparse, datetime, random
 import numpy as np
+import matplotlib.pyplot as plt
 
-from environment.rmab_instances import (
-    get_rmab_sigmoid, get_scheduling, get_constrained, get_routing
-)
+from environment.rmab_instances import get_rmab_sigmoid, get_scheduling, get_constrained, get_routing
 from environment.multi_action import MultiActionRMAB
 
 from algos.repo_bridge import linear_solver_approx
-from algos.dpmd_experiment import run_dpmd_only
-
+from algos.dpmd_experiment_jax import run_dpmd_only
 
 def main():
     parser = argparse.ArgumentParser()
@@ -37,25 +34,31 @@ def main():
     elif args.rmab_type == 'routing':
         rmab, t_rmab = get_routing(args.horizon, args.n_arms, args.budget, rmab_type='multistate')
     else:
-        raise NotImplementedError(f"{args.rmab_type} not supported in this dpmd-rf driver yet.")
+        raise NotImplementedError(f"{args.rmab_type} not supported in this dpmd-only driver yet.")
 
     if isinstance(rmab, MultiActionRMAB):
         print(f"[info] MultiAction wrapper detected: {rmab.link_type}")
 
     linear_solver = linear_solver_approx(rmab)
 
-    print(f'Running DPMD-RF on {rmab} with J={rmab.n_arms}, H={rmab.horizon}, B={args.budget}')
+    print(f'Running DPMD on {rmab} with J={rmab.n_arms}, H={rmab.horizon}, B={args.budget}')
     os.makedirs('./plots', exist_ok=True)
     ts = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
 
-    rewards = run_dpmd_only(rmab, t_rmab, args.horizon, args.budget,
-                            args.n_episodes_eval, args.seed, linear_solver)
+    rewards = run_dpmd_only(rmab, t_rmab, args.horizon, args.budget, args.n_episodes_eval, args.seed, linear_solver)
 
     print('--------------------------------------------------------')
-    print('DPMD-RF results')
+    print('DPMD results')
     print('--------------------------------------------------------')
     print(f'Avg reward: {rewards.mean():.3f} over {len(rewards)} steps')
 
+    # x = np.arange(args.horizon * args.n_episodes_eval)
+    # plt.figure()
+    # plt.plot(x, np.sort(rewards.copy()), label='dpmd')
+    # plt.legend(); plt.tight_layout()
+    # out_png = f'./plots/{args.prefix}dpmd_only_{rmab}_seed{args.seed}_{ts}.png'
+    # plt.savefig(out_png); plt.close('all')
+    # print(f"Saved plot to {out_png}")
 
 if __name__ == '__main__':
     main()
