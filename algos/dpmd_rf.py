@@ -1,4 +1,4 @@
-# algos/dpmd.py
+# algos/dpmd_rf.py
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Optional, NamedTuple
