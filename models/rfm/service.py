@@ -21,6 +21,7 @@ class _RFMService:
         self.act_dim: int | None = None
         self.lr: float = 1e-4
         self.seed: int = 0
+        self._prev_z: Tensor | None = None  # carries last batch of z
 
     def init(self, obs_dim: int, act_dim: int, lr: float = 1e-4, seed: int = 0, force: bool = False):
         if (self.model is not None and not force
@@ -31,26 +32,33 @@ class _RFMService:
         self.obs_dim, self.act_dim = int(obs_dim), int(act_dim)
         self.model = RFMPolicy(self.obs_dim, self.act_dim).to(self.device)
         self.optim = optim.Adam(self.model.parameters(), lr=self.lr)
+        self._prev_z = None
 
     def update(self, obs_np: np.ndarray, z1_np: np.ndarray, w_np: np.ndarray) -> float:
+        """Use previous-iteration z as base point (z0)."""
         assert self.model is not None and self.optim is not None
-        obs = _flatten_obs(obs_np).to(self.device)  # [B, F]
+        obs = _flatten_obs(obs_np).to(self.device)
         z1  = torch.as_tensor(z1_np, device=self.device, dtype=torch.float32)
         w   = torch.as_tensor(w_np,  device=self.device, dtype=torch.float32)
         if z1.dim() == 1: z1 = z1.unsqueeze(0)
-        if w.dim()  == 0: w  = w.unsqueeze(0)
+        if w.dim() == 0:  w  = w.unsqueeze(0)
 
         if obs.shape[1] != self.obs_dim:
             obs = obs[:, :self.obs_dim] if obs.shape[1] > self.obs_dim else torch.nn.functional.pad(
                 obs, (0, self.obs_dim - obs.shape[1]))
         if z1.shape[1] != self.act_dim:
             raise ValueError(f"z1 dim {z1.shape[1]} != act_dim {self.act_dim}")
-        z1 = normalize(z1)
+
+        if self._prev_z is None:
+            raise RuntimeError("No previous z stored; initialize self._prev_z before first update.")
+        z0 = self._prev_z.to(self.device)
 
         self.optim.zero_grad(set_to_none=True)
-        loss = self.model.rfm_loss(obs, z1, w)
+        loss = self.model.rfm_loss(obs, z0, z1, w)
         loss.backward()
         self.optim.step()
+
+        self._prev_z = z1.detach().cpu()
         return float(loss.detach().cpu())
 
     @torch.no_grad()
@@ -60,7 +68,8 @@ class _RFMService:
         if obs.shape[1] != self.obs_dim:
             obs = obs[:, :self.obs_dim] if obs.shape[1] > self.obs_dim else torch.nn.functional.pad(
                 obs, (0, self.obs_dim - obs.shape[1]))
-        Z = self.model.sample(obs, K=K, steps=steps)  # [B, K, D] on sphere
+        Z = self.model.sample(obs, K=K, steps=steps)
         return Z.detach().cpu().numpy()
+
 
 rfm_service = _RFMService()

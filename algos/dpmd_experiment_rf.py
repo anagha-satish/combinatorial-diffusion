@@ -116,6 +116,7 @@ def run_dpmd_only(env, t_env, horizon: int, budget: int, n_episodes_eval: int,
 
     # --- training ---
     batch_size, train_updates = 64, 500
+    rfm_service._prev_z = torch.randn(batch_size, act_dim).cpu()
     for _ in range(train_updates):
         b = buffer.sample(min(batch_size, buffer.size))
         train_one_step(learner, b)
