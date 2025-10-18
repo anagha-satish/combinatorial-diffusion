@@ -5,9 +5,11 @@ from torch import Tensor
 
 # ---------- S^D geometry helpers ----------
 def normalize(x: Tensor, eps: float = 1e-8) -> Tensor:
+    """Project any vector(s) to the unit sphere"""
     return x / (x.norm(dim=-1, keepdim=True) + eps)
 
 def sphere_logmap(p: Tensor, x: Tensor, eps: float = 1e-8) -> Tensor: # Log_c
+    """Compute the Riemannian log map on the sphere: a tangent vector at p"""
     dot = (p * x).sum(dim=-1, keepdim=True).clamp(-1 + 1e-6, 1 - 1e-6) # <p,x> = cos theta
     v = x - dot * p # x - costheta * p
     theta = torch.arccos(dot) # theta = arccos(<p,x>)
@@ -15,15 +17,16 @@ def sphere_logmap(p: Tensor, x: Tensor, eps: float = 1e-8) -> Tensor: # Log_c
     return v * (theta / nv) # (theta/sintheta) * (x - costheta * p)
 
 def sphere_expmap(p: Tensor, v: Tensor, eps: float = 1e-8) -> Tensor: #Exp_c
+    """Exponential map: move from point p along tangent v by geodesic distance ||v||"""
     nv = v.norm(dim=-1, keepdim=True).clamp_min(eps)
     return normalize(p * torch.cos(nv) + v * (torch.sin(nv) / nv))
 
 def geodesic_velocity(p: Tensor, x: Tensor, t: Tensor) -> tuple[Tensor, Tensor]:
-    """Velocity and point along the geodesic z(t) from p to x."""
+    """Return (dc/dt at time t, c_t) along the geodesic from p to x on S^{D-1}."""
     xi = sphere_logmap(p, x) #Log_c
     xi_norm = xi.norm(dim=-1, keepdim=True).clamp_min(1e-8)
     t = t.view(-1, 1)
-    c_t = sphere_expmap(p, t * xi)   #c_t = Exp_c(t * Log_c0(c1))
+    c_t = sphere_expmap(p, t * xi)   #geodesic interp = c_t = Exp_c(t * Log_c0(c1))
     a = -(torch.sin(t * xi_norm) * xi_norm) * p
     b = torch.cos(t * xi_norm) * xi
     dcdt = a + b #derivative of c_t, closed form
@@ -45,7 +48,7 @@ class RFMPolicy(nn.Module):
         self.act_dim = act_dim
 
     def forward(self, obs: Tensor, z_t: Tensor, t: Tensor) -> Tensor:
-        # If z_t is batched, make obs and t match that batch size, fixing previous issue of unsqueezing obs
+        """If z_t is batched, make obs and t match that batch size, fixing previous issue of unsqueezing obs"""
         if z_t.dim() == 2:
             B = z_t.shape[0]
             if obs.dim() == 1:
@@ -70,35 +73,38 @@ class RFMPolicy(nn.Module):
         """Return [B, K, D] samples on the sphere."""
         if obs.dim() == 1: obs = obs.unsqueeze(0)
         B, D = obs.shape[0], self.act_dim
+        # Base noise on the sphere
         z = normalize(torch.randn(B * K, D, device=obs.device))
         obs_rep = obs.repeat_interleave(K, dim=0)
         dt = 1.0 / steps
         for i in range(steps):
-            t = torch.full((B * K,), i * dt, device=obs.device)
-            u = self.forward(obs_rep, z, t)
-            z = sphere_expmap(z, dt * u)
+            t = torch.full((B * K,), i * dt, device=obs.device) # continuous time feature
+            u = self.forward(obs_rep, z, t) # tangent velocity at current z
+            z = sphere_expmap(z, dt * u) # integrate one step on the sphere
         return z.view(B, K, D)
 
-    def rfm_loss(self, obs: Tensor, z0: Tensor, z1: Tensor, w: Tensor) -> Tensor:
-        """
-        Weighted Riemannian Flow Matching loss using a supplied base point z0
-        (from previous iteration), and target endpoint z1.
-        No normalization is applied to z1 here (caller controls that).
-        """
+    def rfm_loss(self, obs: Tensor, z1: Tensor, w: Tensor) -> Tensor:
+        """Weighted Riemannian flow-matching loss on S^{D-1}."""
+        # make sure tensors are batched
         if obs.dim() == 1: obs = obs.unsqueeze(0)
-        if z0.dim() == 1:  z0  = z0.unsqueeze(0)
         if z1.dim() == 1:  z1  = z1.unsqueeze(0)
-        if w.dim() == 0:   w   = w.unsqueeze(0)
+        if w.dim()  == 0:  w   = w.unsqueeze(0)
 
-        # ensure base point is on S^{D-1} (samples from sample() already are; this is safety)
-        z0 = normalize(z0)
+        B = z1.shape[0]
 
-        B, _ = z1.shape
-        t = torch.rand(B, device=z1.device)  # t ~ U(0,1)
+        # sample start point (uniform on sphere via normalized Gaussian)
+        z0 = normalize(torch.randn_like(z1))
 
+        # pick interpolation time t ~ U(0,1)
+        t = torch.rand(B, device=z1.device)
+
+        # target velocity u*(c_t) from geodesic between z0 and z1
         with torch.no_grad():
-            u_star, z_t = geodesic_velocity(z0, z1, t)  # target tangent field on path
+            u_star, z_t = geodesic_velocity(z0, z1, t)
 
+        # modelled velocity u_theta(c_t, s, t)
         u = self.forward(obs, z_t, t)
+
+        # weighted squared error
         err = (u - u_star).pow(2).sum(dim=-1)
         return (w * err).mean()

@@ -6,4 +6,6 @@ __pycache__/
 *.log
 .ipynb_checkpoints/
 .env
-
+loss_curves/
+*.png
+*.csv
