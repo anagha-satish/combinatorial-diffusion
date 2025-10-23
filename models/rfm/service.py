@@ -35,26 +35,23 @@ class _RFMService:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: RFMPolicy | None = None
+        self.model_target: RFMPolicy | None = None
         self.optim: optim.Optimizer | None = None
         self.obs_dim: int | None = None
         self.act_dim: int | None = None
-        self.lr: float = 1e-4
+        self.lr: float | None = None
         self.seed: int = 0
 
-    # Initialize the RFM model and optimizer.
-    def init(self, obs_dim: int, act_dim: int, lr: float = 1e-4, seed: int = 0, force: bool = False):
-        # Avoid re-init if already correct dimensions
-        if (self.model is not None and not force
-            and self.obs_dim == obs_dim and self.act_dim == act_dim):
-            return
+    def init(self, obs_dim: int, act_dim: int, lr: float, seed: int = 0, force: bool = False):
         self.lr, self.seed = float(lr), int(seed)
-
         # Set seeds for reproducibility
         torch.manual_seed(self.seed); np.random.seed(self.seed)
         # Save shape info
         self.obs_dim, self.act_dim = int(obs_dim), int(act_dim)
         # Instantiate Riemannian Flow policy
         self.model = RFMPolicy(self.obs_dim, self.act_dim).to(self.device)
+        self.model_target = RFMPolicy(self.obs_dim, self.act_dim).to(self.device)
+        self.model_target.load_state_dict(self.model.state_dict())
         self.optim = optim.Adam(self.model.parameters(), lr=self.lr)
 
     # One gradient update step for the actor.
@@ -82,38 +79,48 @@ class _RFMService:
 
     # Generate samples (coefficients c) from the learned flow
     @torch.no_grad()
-    def sample(
-        self,
-        obs_np: np.ndarray,
-        K: int,
-        steps: int = 30,
-        *,
-        kappa: float | None = None,
-        J_noise: int = 1,
-    ) -> np.ndarray:
-        """
-        Sample K base latents z from the learned RFM policy; optionally add vMF noise.
-        """
+    def sample(self, obs_np: np.ndarray, K: int, steps: int = 30, *, kappa: float | None = None, J_noise: int = 1) -> np.ndarray:
         assert self.model is not None
         obs = _flatten_obs(obs_np).to(self.device)
         if obs.shape[1] != self.obs_dim:
-            obs = obs[:, :self.obs_dim] if obs.shape[1] > self.obs_dim else torch.nn.functional.pad(
-                obs, (0, self.obs_dim - obs.shape[1]))
-            
-        # Integrate the Riemannian flow to obtain K samples per state
-        Z = self.model.sample(obs, K=K, steps=steps)  # [B, K, D] on sphere
-
+            obs = obs[:, :self.obs_dim]
+        Z = self.model.sample(obs, K=K, steps=steps)  # [B,K,D]
         if (kappa is None) or (J_noise <= 0) or (float(kappa) <= 0):
             return Z.detach().cpu().numpy()
-
-        # Add vMF noise to each base sample
         B, K_, D = Z.shape
         mu = Z.reshape(B * K_, D)
-        Z_noisy = _vmf_perturb(mu, kappa=float(kappa), J=int(J_noise))  # [B*K, J, D]
+        Z_noisy = _vmf_perturb(mu, kappa=float(kappa), J=int(J_noise))  # [B*K,J,D]
         Z_noisy = Z_noisy.reshape(B, K_ * int(J_noise), D)
         return Z_noisy.detach().cpu().numpy()
 
-    # Generate random vMF samples around given mu on sphere
+    @torch.no_grad()
+    def sample_target(self, obs_np: np.ndarray, K: int, steps: int = 30, *, kappa: float | None = None, J_noise: int = 1) -> np.ndarray:
+        """Sample from the target actor."""
+        assert self.model_target is not None
+        obs = _flatten_obs(obs_np).to(self.device)
+        if obs.shape[1] != self.obs_dim:
+            obs = obs[:, :self.obs_dim]
+        Z = self.model_target.sample(obs, K=K, steps=steps)
+        if (kappa is None) or (J_noise <= 0) or (float(kappa) <= 0):
+            return Z.detach().cpu().numpy()
+        B, K_, D = Z.shape
+        mu = Z.reshape(B * K_, D)
+        Z_noisy = _vmf_perturb(mu, kappa=float(kappa), J=int(J_noise))
+        Z_noisy = Z_noisy.reshape(B, K_ * int(J_noise), D)
+        return Z_noisy.detach().cpu().numpy()
+
+    @torch.no_grad()
+    def sync_target_from_current(self) -> None:
+        if self.model is None or self.model_target is None: return
+        self.model_target.load_state_dict(self.model.state_dict())
+
+    @torch.no_grad()
+    def soft_update_target(self, tau: float) -> None:
+        if self.model is None or self.model_target is None: return
+        with torch.no_grad():
+            for p_t, p in zip(self.model_target.parameters(), self.model.parameters()):
+                p_t.mul_(1.0 - tau).add_(p, alpha=tau)
+
     @torch.no_grad()
     def perturb(self, mu_np: np.ndarray, kappa: float, J: int = 1) -> np.ndarray:
         """

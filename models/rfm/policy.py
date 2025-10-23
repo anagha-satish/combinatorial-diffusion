@@ -85,26 +85,29 @@ class RFMPolicy(nn.Module):
 
     def rfm_loss(self, obs: Tensor, z1: Tensor, w: Tensor) -> Tensor:
         """Weighted Riemannian flow-matching loss on S^{D-1}."""
-        # make sure tensors are batched
+        # ensure batched
         if obs.dim() == 1: obs = obs.unsqueeze(0)
         if z1.dim() == 1:  z1  = z1.unsqueeze(0)
         if w.dim()  == 0:  w   = w.unsqueeze(0)
 
         B = z1.shape[0]
-
-        # sample start point (uniform on sphere via normalized Gaussian)
+        # sample z0 ~ Uniform(S^{D-1})
         z0 = normalize(torch.randn_like(z1))
 
-        # pick interpolation time t ~ U(0,1)
-        t = torch.rand(B, device=z1.device)
+        # sample t ~ U(0,1)
+        t = torch.rand(B, device=z1.device).clamp_max(1.0 - 1e-6)  # avoid 1/(1-t) blowup
 
-        # target velocity u*(c_t) from geodesic between z0 and z1
-        with torch.no_grad():
-            u_star, z_t = geodesic_velocity(z0, z1, t)
+        # geodesic interpolation
+        xi_01 = sphere_logmap(z0, z1)                  # Log_{z0}(z1)
+        z_t   = sphere_expmap(z0, t.view(-1,1) * xi_01)  # c_t
 
-        # modelled velocity u_theta(c_t, s, t)
+        # MD target velocity
+        log_ct_z1 = sphere_logmap(z_t, z1)             # Log_{c_t}(z1)
+        proj = log_ct_z1 - (log_ct_z1 * z_t).sum(dim=-1, keepdim=True) * z_t
+        u_star = proj / (1.0 - t).view(-1,1)
+
+        # model velocity
         u = self.forward(obs, z_t, t)
 
-        # weighted squared error
         err = (u - u_star).pow(2).sum(dim=-1)
         return (w * err).mean()
