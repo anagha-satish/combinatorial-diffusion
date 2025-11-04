@@ -69,25 +69,40 @@ def _fit_width(x: Tensor, target_F: int) -> Tensor:
 class DPMDConfig:
     # RL
     gamma: float = 0.99
-    lr: float = 3e-4
-    tau: float = 0.005          # target soft-update coeff
-    delay_update: int = 2       # update targets every N steps
-    reward_scale: float = 0.2
+    lr: float = 4e-4
+    tau: float = 0.005
+    delay_update: int = 2
+    reward_scale: float = 1.0
 
     # Actor sampling / candidate eval
-    num_particles: int = 8      # K candidates per state
+    num_particles: int = 12
 
     # Mirror-descent temperature for weights
-    lambda_temp: float = 0.7
-    w_clip: Optional[float] = 50.0
+    w_clip: Optional[float] = 6.0
+
+    # temperature schedule for per-state softmax weights
+    lambda_start: float = 2.0
+    lambda_end:   float = 0.8
+    lambda_steps: int   = 10_000   # updates over which to anneal
+
 
     # Execution noise (on-sphere)
-    kappa_exec: float = 20.0    # vMF κ for executed coefficients
+    kappa_exec: float = 28.0
 
     # Smoothed Bellman operator
-    kappa_smooth: float = 20.0  # vMF κ for target smoothing
-    M_smooth: int = 8           # #policy samples c' ~ π_target(·|s')
-    J_smooth: int = 1           # #vMF perturbations per c'
+    kappa_smooth: float = 28.0
+    M_smooth: int = 16
+    J_smooth: int = 1
+
+    # running statistics for Q normalization: EMA coeff
+    q_running_beta: float = 0.05
+    q_norm_clip: float = 3          # clamp normalized Q to [-q_norm_clip, q_norm_clip]
+    # temperature learning (log_alpha) to scale normalized Q in weights
+    alpha_lr: float = 3e-2
+    delay_alpha_update: int = 180
+    target_entropy: float = 0.0
+
+    flow_steps: int = 36           # RFM flow integration steps
 
 class DPMD:
     """
@@ -102,6 +117,7 @@ class DPMD:
         self.obs_dim = int(obs_dim)
         self.act_dim = int(act_dim)
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        assert self.act_dim > 0 and self.obs_dim > 0, "Bad dims"
 
         # Critics and targets (twin Q; use min)
         self.q1 = QNet(self.obs_dim, self.act_dim).to(self.device)
@@ -117,10 +133,14 @@ class DPMD:
         )
 
         # MD weight baseline (EMA of target-critic values)
-        self._w_mean: Optional[float] = None
-        self._w_std: Optional[float] = None
         self.step = 0
         self.policy_version = 0
+        self._q_mean: float = 0.0
+        self._q_std: float = 1.0
+
+        # Learnable temperature log_alpha
+        self.log_alpha = nn.Parameter(torch.tensor(0.0, device=self.device))
+        self.alpha_optim = optim.Adam([self.log_alpha], lr=self.cfg.alpha_lr)
 
         # Keep target actor aligned initially
         if hasattr(rfm_service, "sync_target_from_current"):
@@ -135,10 +155,10 @@ class DPMD:
         obs = _fit_width(obs, self.obs_dim)
         if use_target and hasattr(rfm_service, "sample_target"):
             C_np = rfm_service.sample_target(obs_np=obs.detach().cpu().numpy(),
-                                             K=K, steps=30, kappa=None, J_noise=1)
+                                             K=K, steps=self.cfg.flow_steps, kappa=None, J_noise=1)
         else:
             C_np = rfm_service.sample(obs_np=obs.detach().cpu().numpy(),
-                                      K=K, steps=30, kappa=None, J_noise=1)
+                                      K=K, steps=self.cfg.flow_steps, kappa=None, J_noise=1)
         return _to_tensor(C_np, self.device)  # [B, K, D]
 
     @torch.no_grad()
@@ -164,37 +184,99 @@ class DPMD:
         tmin = torch.minimum(tq1, tq2)
         q_star_target = tmin[torch.arange(B, device=self.device), idx]
         return a_star, q_star_online, q_star_target
+    
+    def _current_lambda(self) -> float:
+        s = min(1.0, self.step / max(1, self.cfg.lambda_steps))
+        return float((1.0 - s) * self.cfg.lambda_start + s * self.cfg.lambda_end)
+
+    @torch.no_grad()
+    def _weights_from_hatc(
+        self,
+        s_old: Tensor,          # [B, F]
+        c1: Tensor,             # [B, D]  (replay: action_star ~ π_old)
+        *,
+        J: int,
+        kappa: float,
+        lam: float,
+        w_clip: Optional[float] = None,
+    ) -> Tensor:
+        """
+        Compute per-sample MD weights using target critics on vMF-perturbed \hat c.
+        """
+        B = s_old.shape[0]
+        # vMF J-perturbations per sample -> [B, J, D]
+        hatc_np = rfm_service.perturb(c1.detach().cpu().numpy(), kappa=kappa, J=J)
+        hatc = torch.as_tensor(hatc_np, device=self.device, dtype=torch.float32)
+
+
+        # score with target critics
+        rep_obs = s_old.unsqueeze(1).expand(B, J, self.obs_dim).reshape(B * J, self.obs_dim)
+        flat_hatc = hatc.reshape(B * J, self.act_dim)
+        tq1 = self.tq1(rep_obs, flat_hatc).view(B, J)
+        tq2 = self.tq2(rep_obs, flat_hatc).view(B, J)
+        qmin_hat = torch.minimum(tq1, tq2).mean(dim=1)  # [B]
+        qmin_hat = qmin_hat - qmin_hat.mean() # center for stability
+
+        # running stats
+        self._q_mean = (1 - self.cfg.q_running_beta) * self._q_mean + self.cfg.q_running_beta * float(qmin_hat.mean())
+        self._q_std  = (1 - self.cfg.q_running_beta) * self._q_std  + self.cfg.q_running_beta * float(qmin_hat.std() + 1e-6)
+        q_norm_ema = (qmin_hat - self._q_mean) / (self._q_std + 1e-6)
+
+        # quick batch z-score (guards early training)
+        q_norm_batch = (qmin_hat - qmin_hat.mean()) / (qmin_hat.std() + 1e-6)
+
+        # blend and clip
+        q_norm = 0.5 * q_norm_ema + 0.5 * q_norm_batch
+        q_norm = torch.clamp(q_norm, -self.cfg.q_norm_clip, self.cfg.q_norm_clip)
+
+        # MD weights on normalized \hat c
+        alpha = torch.exp(self.log_alpha).detach()
+        lam = max(float(lam), 1e-6)
+        logits = (alpha * q_norm) / lam
+
+        w = torch.exp(logits)
+        if w_clip is not None:
+            w = torch.clamp(w, max=float(w_clip))
+
+        return w
 
     # -----------------------------
     # Smoothed Bellman target V^b_κ(s')
     # -----------------------------
     @torch.no_grad()
     def _smoothed_value(self, next_obs: Tensor) -> Tensor:
-        """
-        Monte-Carlo approximation of V^b_κ(s'):
-        """
         next_obs = _fit_width(next_obs, self.obs_dim)  # [B,F]
         B = next_obs.shape[0]
         M = max(1, int(self.cfg.M_smooth))
         J = max(1, int(self.cfg.J_smooth))
         kappa = float(self.cfg.kappa_smooth)
 
+        # Candidates from target actor
         Cprime = self._sample_candidates(next_obs, M, use_target=True)  # [B,M,D]
 
-        # Perturb each c' with vMF on the sphere (J times)
-        perturbed = []
-        for m in range(M):
-            cm = Cprime[:, m]  # [B,D]
-            cm_tilde = rfm_service.perturb(cm.detach().cpu().numpy(), kappa=kappa, J=J)  # [B,J,D]
-            perturbed.append(_to_tensor(cm_tilde, self.device))
-        Chat = torch.stack(perturbed, dim=1)  # [B,M,J,D]
+        # vMF perturbations for smoothing
+        cm = Cprime.reshape(B * M, self.act_dim)
+        cm_tilde = rfm_service.perturb(cm.detach().cpu().numpy(), kappa=kappa, J=J)  # [B*M, J, D]
+        Chat = _to_tensor(cm_tilde, self.device).reshape(B, M, J, self.act_dim)
 
-        rep_obs = next_obs.view(B, 1, 1, self.obs_dim).expand(B, M, J, self.obs_dim).reshape(B*M*J, self.obs_dim)
-        flat_c  = Chat.reshape(B * M * J, self.act_dim)
+
+        rep_obs = next_obs.view(B, 1, 1, self.obs_dim)\
+                        .expand(B, M, J, self.obs_dim)\
+                        .reshape(B*M*J, self.obs_dim)
+        flat_c  = Chat.reshape(B*M*J, self.act_dim)
 
         q1 = self.tq1(rep_obs, flat_c).view(B, M, J)
         q2 = self.tq2(rep_obs, flat_c).view(B, M, J)
-        return torch.minimum(q1, q2).mean(dim=(1, 2))  # [B]
+        qmin = torch.minimum(q1, q2)                                    # [B,M,J]
+
+        qflat = qmin.view(B, -1)                 # [B, M*J]
+        k = int(0.2 * qflat.shape[1])           # trim 20%
+        vals, _ = torch.sort(qflat, dim=1, descending=True)
+        Vb = vals[:, :-k].mean(dim=1) if k>0 else vals.mean(dim=1)
+
+        return Vb
+
+
 
     # -----------------------------
     # Main update
@@ -216,31 +298,51 @@ class DPMD:
             y  = rew + (1.0 - done) * self.cfg.gamma * Vb
 
         # 2) Critic updates
+        def huber(a, b, delta=2.0):
+            x = a - b
+            absx = torch.abs(x)
+            return torch.where(absx < delta, 0.5*x*x, delta*(absx - 0.5*delta)).mean()
+
         self.q_optim.zero_grad(set_to_none=True)
-        q1_loss = torch.mean((self.q1(obs, act_exec) - y) ** 2)
-        q2_loss = torch.mean((self.q2(obs, act_exec) - y) ** 2)
+        q1_loss = huber(self.q1(obs, act_exec), y, delta=5.0)
+        q2_loss = huber(self.q2(obs, act_exec), y, delta=5.0)
         (q1_loss + q2_loss).backward()
+        torch.nn.utils.clip_grad_norm_(list(self.q1.parameters())+list(self.q2.parameters()), 10.0)
         self.q_optim.step()
 
-        # 3) MD weights from target critics on (s_old, c1_old=c*)
+        # 3) Actor update using π_old samples from replay with MD weights on vMF-perturbed \hat c
         with torch.no_grad():
-            s_old  = _fit_width(_to_tensor(batch.obs,         self.device), self.obs_dim)
-            c1_old = _to_tensor(batch.action_star, self.device)
-            tq1 = self.tq1(s_old, c1_old)
-            tq2 = self.tq2(s_old, c1_old)
-            q_min_t = torch.minimum(tq1, tq2)  # [B]
-            # True MD weight
-            lam = max(self.cfg.lambda_temp, 1e-6)
-            w = torch.exp(q_min_t / lam)
-            if self.cfg.w_clip is not None:
-                w = torch.clamp(w, max=float(self.cfg.w_clip))
+            s_old = _fit_width(_to_tensor(batch.obs, self.device), self.obs_dim)      # [B, F]
+            c1    = _to_tensor(batch.action_star, self.device)                         # [B, D]
+            # weights on \hat c using target critics
+            w = self._weights_from_hatc(
+                s_old, c1,
+                J=int(self.cfg.J_smooth),
+                kappa=float(self.cfg.kappa_smooth),
+                lam=float(self._current_lambda()),
+                w_clip=self.cfg.w_clip
+            )  # [B]
 
-        # 4) Train RFM actor
+        # Train RFM actor on (s, c1, w)
         policy_loss = rfm_service.update(
-            s_old.detach().cpu().numpy(),
-            c1_old.detach().cpu().numpy(),
-            w.detach().cpu().numpy(),
+            s_old.detach().cpu().numpy(),      # [B, F]
+            c1.detach().cpu().numpy(),         # [B, D]  (π_old sample from replay)
+            w.detach().cpu().numpy(),          # [B]
         )
+
+        # 4.5) Delayed temperature (log_alpha) update
+        # Approximate entropy of a Gaussian with variance (0.1 * exp(log_alpha))^2 per dim
+        if (self.step % max(1, int(self.cfg.delay_alpha_update))) == 0:
+            self.alpha_optim.zero_grad(set_to_none=True)
+            approx_entropy = 0.5 * self.act_dim * torch.log(
+                torch.tensor(2.0 * np.pi * np.e, device=self.device, dtype=torch.float32)
+                * (0.1 * torch.exp(self.log_alpha)).pow(2)
+            )
+            # Loss: -log_alpha * (-entropy + target_entropy)
+            alpha_loss = -self.log_alpha * (-approx_entropy.detach() + float(self.cfg.target_entropy))
+            alpha_loss.backward()
+            self.alpha_optim.step()
+
 
         # 5) Soft-update target critics and target actor
         if (self.step % self.cfg.delay_update) == 0:
@@ -272,6 +374,7 @@ class DPMD:
         }
 
 
+
     # -----------------------------
     # Public driver helpers
     # -----------------------------
@@ -288,6 +391,6 @@ class DPMD:
     def sample_candidates(self, obs: np.ndarray, K: int) -> np.ndarray:
         """Draw K coefficient candidates from current actor πθ(·|s)."""
         o = np.asarray(obs, dtype=np.float32).reshape(1, -1)
-        return rfm_service.sample(obs_np=o, K=K, steps=30, kappa=None, J_noise=1)[0]
+        return rfm_service.sample(obs_np=o, K=K, steps=self.cfg.flow_steps, kappa=None, J_noise=1)[0]
 
 __all__ = ["DPMD", "DPMDConfig", "Experience"]

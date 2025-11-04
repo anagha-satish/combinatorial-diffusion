@@ -2,8 +2,6 @@
 """
 Driver for DPMD-RF using tuned defaults.
 """
-import os
-import sys
 import io
 import time
 import argparse
@@ -91,25 +89,53 @@ def main():
     p.add_argument('-s','--seed', type=int, default=0)
 
     # Training budgets
-    p.add_argument('--warmup_steps', type=int, default=800)
-    p.add_argument('--train_updates', type=int, default=1200)
+    p.add_argument('--warmup_steps', type=int, default=1000,
+                   help='steps collected before any gradient updates')
+    p.add_argument('--train_updates', type=int, default=2000,
+                   help='number of training episodes/updates')
     p.add_argument('--batch_size', type=int, default=64)
 
-    # Core RL hyperparameters
+    # Core RL hyperparameters (stable across RMAB variants)
     p.add_argument('--gamma', type=float, default=0.99)
     p.add_argument('--tau', type=float, default=0.005)
     p.add_argument('--delay_update', type=int, default=2)
-    p.add_argument('--reward_scale', type=float, default=0.2)
+    p.add_argument('--reward_scale', type=float, default=1.0,
+                   help='scale rewards before critic targets')
 
-    # Tuned DPMD/RFM hyperparameters
-    p.add_argument('--lr', type=float, default=3.629223204600222e-04)
-    p.add_argument('--num_particles', type=int, default=10)
-    p.add_argument('--lambda_temp', type=float, default=0.6907546519084053)
-    p.add_argument('--kappa_exec', type=float, default=22.217739468876033)
-    p.add_argument('--kappa_smooth', type=float, default=28.260221064757964)
-    p.add_argument('--M_smooth', type=int, default=12)
-    p.add_argument('--J_smooth', type=int, default=2)
-    p.add_argument('--w_clip', type=float, default=50.0)
+    # DPMD / RFM hyperparameters (paper-consistent, stable defaults)
+    p.add_argument('--lr', type=float, default=4e-4,
+                   help='learning rate for RFM actor (and critics)')
+    p.add_argument('--num_particles', type=int, default=12,
+                   help='number of candidate actions K sampled per state')
+
+    # Mirror-descent weighting temperature schedule (Eq. 7)
+    p.add_argument('--lambda_start', type=float, default=2.0)
+    p.add_argument('--lambda_end', type=float, default=0.8)
+    p.add_argument('--lambda_steps', type=int, default=10000)
+    p.add_argument('--w_clip', type=float, default=6.0,
+                   help='max clamp on per-sample mirror-descent weights')
+
+    # von Mises–Fisher execution noise (Alg. 1, Step 7)
+    p.add_argument('--kappa_exec', type=float, default=28.0,
+                   help='vMF concentration during action execution')
+
+    # Smoothed Bellman operator (Eq. 10)
+    p.add_argument('--kappa_smooth', type=float, default=28.0,
+                   help='vMF concentration for target smoothing kernel')
+    p.add_argument('--M_smooth', type=int, default=16,
+                   help='number of target-policy candidates M')
+    p.add_argument('--J_smooth', type=int, default=1,
+                   help='vMF perturbations per candidate J')
+
+    # RFM integration
+    p.add_argument('--flow_steps', type=int, default=36,
+                   help='integration steps for RFM sampling on S^{D-1}')
+
+    # Stability knobs (RFM-for-RL implementation details)
+    p.add_argument('--q_norm_clip', type=float, default=3.0,
+                   help='clip normalized Q before exponentiation')
+    p.add_argument('--q_running_beta', type=float, default=0.05,
+                   help='EMA coefficient for running Q mean/std')
 
     args = p.parse_args()
 
@@ -125,14 +151,19 @@ def main():
         delay_update=args.delay_update,
         reward_scale=args.reward_scale,
         num_particles=args.num_particles,
-        lambda_temp=args.lambda_temp,
         w_clip=args.w_clip,
         kappa_exec=args.kappa_exec,
-        # Smoothed Bellman operator (target smoothing)
         kappa_smooth=args.kappa_smooth,
         M_smooth=args.M_smooth,
         J_smooth=args.J_smooth,
+        flow_steps=args.flow_steps,
+        lambda_start=args.lambda_start,
+        lambda_end=args.lambda_end,
+        lambda_steps=args.lambda_steps,
+        q_norm_clip=args.q_norm_clip,
+        q_running_beta=args.q_running_beta,
     )
+
 
     t0 = time.time()
     rewards = run_dpmd_only(
