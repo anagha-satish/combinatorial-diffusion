@@ -78,7 +78,7 @@ class DPMDConfig:
     num_particles: int = 12
 
     # Mirror-descent temperature for weights
-    w_clip: Optional[float] = 6.0
+    w_clip: Optional[float] = 4.0
 
     # temperature schedule for per-state softmax weights
     lambda_start: float = 2.0
@@ -142,9 +142,45 @@ class DPMD:
         self.log_alpha = nn.Parameter(torch.tensor(0.0, device=self.device))
         self.alpha_optim = optim.Adam([self.log_alpha], lr=self.cfg.alpha_lr)
 
+        # Start cooler so MD weights aren't too peaky early
+        with torch.no_grad():
+            self.log_alpha.copy_(torch.tensor(-0.5, device=self.device))  # temp ≈ 1.105
+
+
         # Keep target actor aligned initially
         if hasattr(rfm_service, "sync_target_from_current"):
             rfm_service.sync_target_from_current()
+
+    # -----------------------------------------------------
+    # Pretraining (myopic)
+    # -----------------------------------------------------
+    def pretrain_critics_step(self, batch: Experience, *, huber_delta: float = 5.0) -> float:
+        """One supervised step for critics using *myopic* targets (gamma=0): y = r."""
+        obs      = _fit_width(_to_tensor(batch.obs,      self.device), self.obs_dim)
+        act_exec = _to_tensor(batch.action,  self.device)
+        rew      = _to_tensor(batch.reward,  self.device).view(-1)  # target
+
+        def huber(a, b, delta=huber_delta):
+            x = a - b
+            ax = torch.abs(x)
+            return torch.where(ax < delta, 0.5*x*x, delta*(ax - 0.5*delta)).mean()
+
+        self.q_optim.zero_grad(set_to_none=True)
+        q1_loss = huber(self.q1(obs, act_exec), rew)
+        q2_loss = huber(self.q2(obs, act_exec), rew)
+        (q1_loss + q2_loss).backward()
+        torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
+        self.q_optim.step()
+
+        # keep targets aligned early on
+        with torch.no_grad():
+            for p_t, p in zip(self.tq1.parameters(), self.q1.parameters()):
+                p_t.copy_(p)
+            for p_t, p in zip(self.tq2.parameters(), self.q2.parameters()):
+                p_t.copy_(p)
+
+        return float((q1_loss + q2_loss).detach().cpu())
+
 
     # -----------------------------
     # Actor helpers

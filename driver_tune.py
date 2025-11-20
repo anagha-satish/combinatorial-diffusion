@@ -1,30 +1,61 @@
 # driver_tune.py
-import os, argparse, csv, random, time
-from typing import Dict, Any, List, Tuple
+"""
+Grid/parallel tuner for DPMD-RF.
+
+Examples
+--------
+# 1) Simple sweep over two hyperparameters and three seeds:
+python driver_tune.py \
+  --lr 1e-4 4e-4 1e-3 \
+  --num_particles 8 12 16 \
+  --seed 0 1 2 \
+  --out results.csv --jobs 3
+
+# 2) Change environment and training budgets too:
+python driver_tune.py \
+  --rmab_type routing \
+  --n_arms 20 --n_actions 3 --budget 2 --horizon 10 \
+  --warmup_steps 1000 --train_updates 2000 --batch_size 64 \
+  --lr 2e-4 4e-4 --num_particles 8 12 \
+  --kappa_exec 16 28 --kappa_smooth 16 28 \
+  --seed 0 1 --jobs 2
+
+Notes
+-----
+- Every flag accepts one or many values; a full Cartesian product is run.
+- Results are written to CSV (default: tune_results.csv) and printed (top 10 by avg reward).
+- Uses the same code paths as driver_dpmd_rf.py (no subprocesses, imports the same modules).
+"""
+
+import argparse
+import itertools
+import json
+import math
+import os
+import time
+from multiprocessing import Pool, cpu_count
+
 import numpy as np
+import torch
 
-try:
-    import torch
-except Exception:
-    torch = None
-
+# Import the same building blocks used by your driver
 from environment.rmab_instances import (
     get_rmab_sigmoid, get_scheduling, get_constrained, get_routing
 )
-from environment.multi_action import MultiActionRMAB
-
 from algos.repo_bridge import linear_solver_approx
 from algos.dpmd_experiment_rf import run_dpmd_only
 from algos.dpmd_rf import DPMDConfig
 
 
 # ----------------------------
-# Global reseeding utilities
+# Utilities copied/adapted to match driver defaults
 # ----------------------------
 def reseed_all(seed: int) -> None:
-    """Reseed Python, NumPy, and (optionally) PyTorch RNGs."""
+    import random
     random.seed(seed)
-    np.random.seed(seed % (2**32 - 1))
+    np_seed = seed % (2**32 - 1)
+    import numpy as _np
+    _np.random.seed(np_seed)
     if torch is not None:
         torch.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
@@ -33,9 +64,6 @@ def reseed_all(seed: int) -> None:
             torch.backends.cudnn.benchmark = False
 
 
-# ----------------------------
-# Environment builders
-# ----------------------------
 def build_env(kind: str, n_arms: int, n_actions: int, budget: int, horizon: int):
     if kind == 'sigmoid':
         return get_rmab_sigmoid(n_arms, n_actions, budget, horizon)
@@ -49,261 +77,286 @@ def build_env(kind: str, n_arms: int, n_actions: int, budget: int, horizon: int)
         raise NotImplementedError(kind)
 
 
-import sys, io, contextlib
-
-def make_env_and_solver(kind: str, n_arms: int, n_actions: int,
-                        budget: int, horizon: int, seed: int):
-    """Build fresh env + solver without spamming stdout."""
+def build_env_quiet(kind: str, n_arms: int, n_actions: int, budget: int, horizon: int, seed: int):
+    # Keep side-effects minimal; silence builders if they print
+    import io, contextlib
     reseed_all(seed)
-
-    # Temporarily silence any prints from environment creation
     with contextlib.redirect_stdout(io.StringIO()):
-        env_i, t_env_i = build_env(kind, n_arms, n_actions, budget, horizon)
+        env, _ = build_env(kind, n_arms, n_actions, budget, horizon)
 
-    for e in (env_i, t_env_i):
-        if hasattr(e, "seed") and callable(getattr(e, "seed")):
-            try:
-                e.seed(seed)
-            except TypeError:
-                pass
-        if hasattr(e, "reset_rng") and callable(getattr(e, "reset_rng")):
-            try:
-                e.reset_rng(seed)
-            except TypeError:
-                pass
-
-    lin_i = linear_solver_approx(env_i)
-    return env_i, t_env_i, lin_i
-
+    if hasattr(env, "seed") and callable(getattr(env, "seed")):
+        try:
+            env.seed(seed)
+        except TypeError:
+            pass
+    if hasattr(env, "reset_rng") and callable(getattr(env, "reset_rng")):
+        try:
+            env.reset_rng(seed)
+        except TypeError:
+            pass
+    return env
 
 
 # ----------------------------
-# Search space helpers
+# Trial execution
 # ----------------------------
-def _sample_lr(rng: random.Random) -> float:
-    # log-uniform over [1e-4, 1e-3]
-    e = rng.uniform(-4.0, -3.0)
-    return 10.0 ** e
-
-def _sample_int(rng: random.Random, choices: List[int]) -> int:
-    return rng.choice(choices)
-
-def _sample_float(rng: random.Random, lo: float, hi: float) -> float:
-    return rng.uniform(lo, hi)
-
-def sample_hparams(rng: random.Random) -> Dict[str, Any]:
-    return {
-        "lr": _sample_lr(rng),                               # 1e-4 .. 1e-3
-        "num_particles": _sample_int(rng, [6, 8, 10, 12]),   # K (candidates per state)
-        "lambda_temp": _sample_float(rng, 0.3, 1.2),         # λ (MD temperature)
-        "kappa_exec": _sample_float(rng, 10.0, 30.0),        # execution noise (vMF)
-        "kappa_smooth": _sample_float(rng, 10.0, 30.0),      # smoothing kernel (vMF) for targets
-        "M_smooth": _sample_int(rng, [6, 8, 10, 12]),        # # actor samples for V^b_κ
-        "J_smooth": _sample_int(rng, [1, 2, 3]),             # # vMF perturbations per actor sample
-    }
-
-
-# ----------------------------
-# One evaluation for a given config
-# ----------------------------
-def run_once(env,
-             linear_solver,
-             seed: int, horizon: int, budget: int,
-             n_episodes_eval: int, hp: Dict[str, Any], train_updates: int, warmup_steps: int,
-             batch_size: int = 64, gamma: float = 0.99, tau: float = 0.005,
-             delay_update: int = 2, reward_scale: float = 0.2) -> Dict[str, Any]:
+def run_trial(trial_args):
     """
-    Build a DPMDConfig from sampled hyperparams and run a single training+eval.
-    Note: matches current DPMDConfig and run_dpmd_only signatures.
+    trial_args: dict of fully-specified arguments for a single run.
+    Returns a result dict with metrics + params.
     """
-    cfg = DPMDConfig(
-        gamma=gamma,
-        lr=float(hp["lr"]),
-        tau=tau,
-        delay_update=delay_update,
-        reward_scale=reward_scale,
-        num_particles=int(hp["num_particles"]),
-        lambda_temp=float(hp["lambda_temp"]),
-        w_clip=50.0,
-        kappa_exec=float(hp["kappa_exec"]),
-        # Smoothed Bellman operator params
-        kappa_smooth=float(hp["kappa_smooth"]),
-        M_smooth=int(hp["M_smooth"]),
-        J_smooth=int(hp["J_smooth"]),
-    )
+    # Defensive copy (process-safe)
+    p = dict(trial_args)
+    t0 = time.time()
 
-    rewards = run_dpmd_only(
-        env,
-        horizon=horizon,
-        budget=budget,
-        n_episodes_eval=n_episodes_eval,
-        seed=seed,
-        linear_solver=linear_solver,
-        cfg=cfg,
-        warmup_steps=warmup_steps,
-        batch_size=batch_size,
-        train_updates=train_updates,
-    )
+    try:
+        # Build env + solver
+        env = build_env_quiet(
+            p['rmab_type'], p['n_arms'], p['n_actions'],
+            p['budget'], p['horizon'], p['seed']
+        )
+        linear_solver = linear_solver_approx(env)
 
-    # Objective = mean per-timestep reward
-    avg_reward = float(np.mean(rewards)) if len(rewards) > 0 else 0.0
-    return {"avg_reward": avg_reward}
+        # Pack config
+        cfg = DPMDConfig(
+            gamma=p['gamma'],
+            lr=p['lr'],
+            tau=p['tau'],
+            delay_update=p['delay_update'],
+            reward_scale=p['reward_scale'],
+            num_particles=p['num_particles'],
+            w_clip=p['w_clip'],
+            kappa_exec=p['kappa_exec'],
+            kappa_smooth=p['kappa_smooth'],
+            M_smooth=p['M_smooth'],
+            J_smooth=p['J_smooth'],
+            flow_steps=p['flow_steps'],
+            lambda_start=p['lambda_start'],
+            lambda_end=p['lambda_end'],
+            lambda_steps=p['lambda_steps'],
+            q_norm_clip=p['q_norm_clip'],
+            q_running_beta=p['q_running_beta'],
+        )
+
+        rewards = run_dpmd_only(
+            env,
+            horizon=p['horizon'],
+            budget=p['budget'],
+            n_episodes_eval=p['n_episodes_eval'],
+            seed=p['seed'],
+            linear_solver=linear_solver,
+            cfg=cfg,
+            warmup_steps=p['warmup_steps'],
+            batch_size=p['batch_size'],
+            train_updates=p['train_updates'],
+        )
+        elapsed = time.time() - t0
+
+        rewards = list(map(float, rewards))
+        avg = float(np.mean(rewards)) if len(rewards) else 0.0
+        std = float(np.std(rewards)) if len(rewards) else 0.0
+
+        return {
+            "ok": True,
+            "avg_reward": avg,
+            "std_reward": std,
+            "rewards_len": len(rewards),
+            "elapsed_sec": round(elapsed, 3),
+            "params": p,
+            # Store compact reward summary; full list optional (can be large)
+            "rewards_head": rewards[:10],
+        }
+
+    except Exception as e:
+        elapsed = time.time() - t0
+        return {
+            "ok": False,
+            "error": f"{type(e).__name__}: {e}",
+            "elapsed_sec": round(elapsed, 3),
+            "params": p,
+        }
 
 
 # ----------------------------
-# Successive Halving Tuner
+# CLI & grid expansion
 # ----------------------------
-def successive_halving(
-    rmab_kind: str,
-    n_arms: int,
-    n_actions: int,
-    budget: int,
-    horizon: int,
-    base_seed: int,
-    n_episodes_eval: int,
-    n_trials: int,
-    rungs: List[Dict[str, int]],
-    results_csv: str,
-) -> None:
-    rng = random.Random(base_seed)
-    os.makedirs(os.path.dirname(results_csv) or ".", exist_ok=True)
+def add_list_arg(parser, name, type_, default, help_):
+    # Every flag accepts one or many values
+    parser.add_argument(f"--{name}", type=type_, nargs="+", default=[default], help=help_)
 
-    # CSV header
-    with open(results_csv, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow([
-            "trial_id","rung","seed",
-            "lr","num_particles","lambda_temp",
-            "kappa_exec","kappa_smooth","M_smooth","J_smooth",
-            "warmup_steps","train_updates",
-            "avg_reward","elapsed_sec",
-        ])
 
-    # Initial pool
-    trials = [{"trial_id": i, "hp": sample_hparams(rng)} for i in range(n_trials)]
+def parse_args():
+    p = argparse.ArgumentParser(description="Grid/parallel tuner for DPMD-RF")
 
-    best_so_far = -1e9
-    for rung_idx, budget_spec in enumerate(rungs):
-        warmup = int(budget_spec["warmup"])
-        updates = int(budget_spec["updates"])
-        print(f"\n[rung {rung_idx}] warmup={warmup} updates={updates} | candidates={len(trials)}")
+    # Environment config
+    add_list_arg(p, "rmab_type", str, "routing", "{sigmoid, scheduling, constrained, routing}")
+    add_list_arg(p, "n_arms", int, 20, "Number of arms")
+    add_list_arg(p, "n_actions", int, 3, "Number of actions")
+    add_list_arg(p, "budget", int, 2, "Budget per step")
+    add_list_arg(p, "horizon", int, 10, "Horizon")
+    add_list_arg(p, "n_episodes_eval", int, 5, "Evaluation episodes per run")
+    add_list_arg(p, "seed", int, 0, "Random seed(s)")
 
-        # Break any residual order bias across rungs
-        rng.shuffle(trials)
+    # Training budgets
+    add_list_arg(p, "warmup_steps", int, 1000, "Steps collected before updates")
+    add_list_arg(p, "train_updates", int, 2000, "Training updates (episodes)")
+    add_list_arg(p, "batch_size", int, 64, "Batch size")
 
-        scored: List[Dict[str, Any]] = []
-        for t in trials:
-            trial_seed = base_seed + t["trial_id"] * 31 + rung_idx
+    # Core RL hyperparameters
+    add_list_arg(p, "gamma", float, 0.99, "Discount")
+    add_list_arg(p, "tau", float, 0.005, "Target update rate")
+    add_list_arg(p, "delay_update", int, 2, "Actor/target delay")
+    add_list_arg(p, "reward_scale", float, 1.0, "Reward scale before targets")
 
-            reseed_all(trial_seed)
+    # DPMD / RFM hyperparameters
+    add_list_arg(p, "lr", float, 4e-4, "Learning rate")
+    add_list_arg(p, "num_particles", int, 12, "K: candidate actions per state")
 
-            # Fresh env + solver per trial
-            env_i, t_env_i, lin_i = make_env_and_solver(
-                kind=rmab_kind,
-                n_arms=n_arms,
-                n_actions=n_actions,
-                budget=budget,
-                horizon=horizon,
-                seed=trial_seed,
-            )
+    # Mirror-descent schedule
+    add_list_arg(p, "lambda_start", float, 2.0, "Start temp")
+    add_list_arg(p, "lambda_end", float, 0.8, "End temp")
+    add_list_arg(p, "lambda_steps", int, 10000, "Temp steps")
+    add_list_arg(p, "w_clip", float, 4.0, "Weight clamp")
 
-            hp = t["hp"]
-            t0 = time.time()
-            metrics = run_once(
-                env_i, lin_i,
-                seed=trial_seed, horizon=horizon, budget=budget,
-                n_episodes_eval=n_episodes_eval, hp=hp,
-                train_updates=updates, warmup_steps=warmup
-            )
-            elapsed = time.time() - t0
+    # vMF execution noise
+    add_list_arg(p, "kappa_exec", float, 28.0, "vMF kappa (execution)")
 
-            row = {
-                "trial_id": t["trial_id"], "rung": rung_idx, "seed": trial_seed,
-                "warmup_steps": warmup, "train_updates": updates,
-                **hp,
-                **metrics,
-                "elapsed_sec": elapsed,
-            }
-            scored.append(row)
+    # Smoothed Bellman operator
+    add_list_arg(p, "kappa_smooth", float, 28.0, "vMF kappa (target smoothing)")
+    add_list_arg(p, "M_smooth", int, 16, "Num target-policy candidates M")
+    add_list_arg(p, "J_smooth", int, 1, "vMF perturbations per candidate J")
 
-            # write row
-            with open(results_csv, "a", newline="") as f:
-                w = csv.writer(f)
-                w.writerow([
-                    row["trial_id"], row["rung"], row["seed"],
-                    row["lr"], row["num_particles"], row["lambda_temp"],
-                    row["kappa_exec"], row["kappa_smooth"], row["M_smooth"], row["J_smooth"],
-                    row["warmup_steps"], row["train_updates"],
-                    row["avg_reward"], row["elapsed_sec"],
-                ])
+    # RFM integration
+    add_list_arg(p, "flow_steps", int, 36, "RFM integration steps")
 
-            best_so_far = max(best_so_far, row["avg_reward"])
-            print(f"[rung {rung_idx}] trial {t['trial_id']:03d} | "
-                  f"avg_reward={row['avg_reward']:.3f} (best={best_so_far:.3f}) | "
-                  f"hp={ {k: row[k] for k in ['lr','num_particles','lambda_temp','kappa_exec','kappa_smooth','M_smooth','J_smooth']} } | "
-                  f"{elapsed:.1f}s")
+    # Stability
+    add_list_arg(p, "q_norm_clip", float, 3.0, "Clip normalized Q")
+    add_list_arg(p, "q_running_beta", float, 0.05, "EMA coeff for Q running stats")
 
-        # Promote top fraction to next rung (keep top 1/η, η≈2)
-        if rung_idx < len(rungs) - 1:
-            scored.sort(key=lambda r: r["avg_reward"], reverse=True)
-            keep = max(1, len(scored) // 2)  # halving
-            hp_keys = ["lr","num_particles","lambda_temp","kappa_exec","kappa_smooth","M_smooth","J_smooth"]
-            trials = [{"trial_id": r["trial_id"], "hp": {k: r[k] for k in hp_keys}} for r in scored[:keep]]
+    # Orchestration
+    p.add_argument("--jobs", type=int, default=max(1, cpu_count() // 2),
+                   help="Parallel worker processes")
+    p.add_argument("--out", type=str, default="tune_results.csv",
+                   help="Path to CSV output")
+    p.add_argument("--save_jsonl", type=str, default="",
+                   help="Optional JSONL with full results (one JSON per line)")
+    p.add_argument("--topk", type=int, default=10,
+                   help="Show top-K in stdout summary")
+    p.add_argument("--dry_run", action="store_true",
+                   help="Only print expanded grid size, do not execute")
 
-    print(f"[tune] done | results at {results_csv}")
+    return p.parse_args()
+
+
+def expand_grid(ns):
+    # Build ordered list of (name, list_of_values)
+    grid_spec = []
+    for k, v in vars(ns).items():
+        # skip orchestration flags
+        if k in {"jobs", "out", "save_jsonl", "topk", "dry_run"}:
+            continue
+        # v is already a list due to nargs="+"
+        if isinstance(v, list):
+            grid_spec.append((k, v))
+    # Cartesian product
+    names = [k for k, _ in grid_spec]
+    values_lists = [vals for _, vals in grid_spec]
+    for combo in itertools.product(*values_lists):
+        yield dict(zip(names, combo))
+
+
+def write_csv(path, rows, header=None):
+    import csv
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    if header is None and rows:
+        header = list(rows[0].keys())
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=header)
+        w.writeheader()
+        for r in rows:
+            w.writerow(r)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument('-D','--rmab_type', type=str, default='routing',
-                    help='{sigmoid, scheduling, constrained, routing}')
-    ap.add_argument('-J','--n_arms', type=int, default=20)
-    ap.add_argument('-N','--n_actions', type=int, default=3)
-    ap.add_argument('-B','--budget', type=int, default=2)
-    ap.add_argument('-H','--horizon', type=int, default=10)
-    ap.add_argument('-V','--n_episodes_eval', type=int, default=5)
-    ap.add_argument('-s','--seed', type=int, default=0)
+    ns = parse_args()
+    trials = list(expand_grid(ns))
+    total = len(trials)
+    print(f"[tuner] Expanded grid: {total} runs (jobs={ns.jobs})")
 
-    ap.add_argument('--n_trials', type=int, default=16,
-                    help='initial number of random configs')
-    ap.add_argument('--results_dir', type=str, default='./results')
-    ap.add_argument('--results_name', type=str, default='tune')
+    if ns.dry_run:
+        return
 
-    # rung budgets (small → larger). Feel free to tweak.
-    ap.add_argument('--rung0_updates', type=int, default=400)
-    ap.add_argument('--rung0_warmup', type=int, default=400)
-    ap.add_argument('--rung1_updates', type=int, default=1200)
-    ap.add_argument('--rung1_warmup', type=int, default=800)
+    # Execute (parallel if jobs > 1)
+    if ns.jobs > 1:
+        with Pool(processes=ns.jobs) as pool:
+            results = list(pool.imap_unordered(run_trial, trials))
+    else:
+        results = [run_trial(t) for t in trials]
 
-    args = ap.parse_args()
+    # Sort by avg reward (descending), then elapsed (ascending)
+    ok_results = [r for r in results if r.get("ok")]
+    bad_results = [r for r in results if not r.get("ok")]
 
-    env_tmp, _ = build_env(args.rmab_type, args.n_arms, args.n_actions, args.budget, args.horizon)
-    if isinstance(env_tmp, MultiActionRMAB):
-        print(f"[info] MultiAction wrapper detected: {env_tmp.link_type}")
-    del env_tmp  # avoid accidental reuse
+    ok_results.sort(key=lambda r: (r["avg_reward"], -r["elapsed_sec"]), reverse=True)
 
-    os.makedirs(args.results_dir, exist_ok=True)
-    ts = time.strftime("%Y-%m-%d_%H-%M-%S")
-    csv_path = os.path.join(args.results_dir, f"{args.results_name}_{ts}.csv")
+    # Prepare CSV rows
+    csv_rows = []
+    for r in ok_results:
+        flat = dict(
+            ok=r["ok"],
+            avg_reward=round(r["avg_reward"], 6),
+            std_reward=round(r["std_reward"], 6),
+            rewards_len=r["rewards_len"],
+            elapsed_sec=r["elapsed_sec"],
+        )
+        # Flatten selected params into CSV columns
+        for k, v in r["params"].items():
+            flat[k] = v
+        csv_rows.append(flat)
 
-    rungs = [
-        {"updates": args.rung0_updates, "warmup": args.rung0_warmup},
-        {"updates": args.rung1_updates, "warmup": args.rung1_warmup},
-    ]
+    # Include failures at the end of CSV for visibility
+    for r in bad_results:
+        flat = dict(
+            ok=False,
+            avg_reward=float("nan"),
+            std_reward=float("nan"),
+            rewards_len=0,
+            elapsed_sec=r["elapsed_sec"],
+            error=r.get("error", "unknown"),
+        )
+        for k, v in r["params"].items():
+            flat[k] = v
+        csv_rows.append(flat)
 
-    print(f"[tune] starting | trials={args.n_trials} | rungs={rungs} | csv={csv_path}")
-    successive_halving(
-        rmab_kind=args.rmab_type,
-        n_arms=args.n_arms,
-        n_actions=args.n_actions,
-        budget=args.budget,
-        horizon=args.horizon,
-        base_seed=args.seed,
-        n_episodes_eval=args.n_episodes_eval,
-        n_trials=args.n_trials,
-        rungs=rungs,
-        results_csv=csv_path,
-    )
+    # Write CSV
+    if csv_rows:
+        write_csv(ns.out, csv_rows)
+        print(f"[tuner] Wrote {len(csv_rows)} rows to {ns.out}")
+
+    # Optional JSONL dump (with full params + small reward head)
+    if ns.save_jsonl:
+        os.makedirs(os.path.dirname(ns.save_jsonl) or ".", exist_ok=True)
+        with open(ns.save_jsonl, "w") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
+        print(f"[tuner] Wrote JSONL details to {ns.save_jsonl}")
+
+    # Console summary
+    print("\n=== TOP RESULTS ===")
+    show_k = min(ns.topk, len(ok_results))
+    for i in range(show_k):
+        r = ok_results[i]
+        p = r["params"]
+        print(
+            f"#{i+1:02d} avg={r['avg_reward']:.6f} ±{r['std_reward']:.6f} "
+            f"(len={r['rewards_len']}, {r['elapsed_sec']:.1f}s) | "
+            f"lr={p['lr']} K={p['num_particles']} seed={p['seed']} "
+            f"exec_kappa={p['kappa_exec']} smooth_kappa={p['kappa_smooth']} "
+            f"rmab={p['rmab_type']}"
+        )
+
+    if bad_results:
+        print(f"\n[warn] {len(bad_results)} runs failed; last error: {bad_results[-1].get('error')}")
 
 
 if __name__ == "__main__":

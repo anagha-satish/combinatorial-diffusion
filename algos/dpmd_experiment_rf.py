@@ -150,6 +150,22 @@ def run_dpmd_only(
                 break
         learner.policy_version += 1
 
+    # -------- Tiny myopic pretraining: critics only (gamma=0) --------
+    pretrain_critic_iters = min(64, max(8, warmup_steps // max(1, 32 * batch_size)))
+
+    for _ in range(int(pretrain_critic_iters)):
+        b = buffer.sample(min(batch_size, buffer.size_filled))
+        learner.pretrain_critics_step(Experience(*b))
+
+    # Hard resync targets and actor after pretrain
+    if hasattr(rfm_service, "sync_target_from_current"):
+        rfm_service.sync_target_from_current()
+    for p_t, p in zip(learner.tq1.parameters(), learner.q1.parameters()):
+        p_t.data.copy_(p.data)
+    for p_t, p in zip(learner.tq2.parameters(), learner.q2.parameters()):
+        p_t.data.copy_(p.data)
+
+
     # -------- Training: episodic, per-step updates--------
     import os, datetime, matplotlib.pyplot as plt
     os.makedirs("loss_curves", exist_ok=True)
@@ -178,12 +194,14 @@ def run_dpmd_only(
             buffer.add(obs, c_exec, r_scalar, next_obs, float(done),
                        coeff_star=c_star, policy_id=learner.policy_version)
 
-            # one update per step (DQN-style)
-            b = buffer.sample(min(batch_size, buffer.size_filled))
-            info = train_one_step(learner, b)
-            loss_history["q1"].append(info["q1_loss"])
-            loss_history["q2"].append(info["q2_loss"])
-            loss_history["policy"].append(info["policy_loss"])
+            # one update per step
+            MIN_WARM_BATCHES = 3 * batch_size
+            if buffer.size_filled >= max(batch_size, MIN_WARM_BATCHES):
+                b = buffer.sample(batch_size)
+                info = train_one_step(learner, b)
+                loss_history["q1"].append(info["q1_loss"])
+                loss_history["q2"].append(info["q2_loss"])
+                loss_history["policy"].append(info["policy_loss"])
 
             obs = next_obs
             if done:

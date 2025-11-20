@@ -112,7 +112,7 @@ def main():
     p.add_argument('--lambda_start', type=float, default=2.0)
     p.add_argument('--lambda_end', type=float, default=0.8)
     p.add_argument('--lambda_steps', type=int, default=10000)
-    p.add_argument('--w_clip', type=float, default=6.0,
+    p.add_argument('--w_clip', type=float, default=4.0,
                    help='max clamp on per-sample mirror-descent weights')
 
     # von Mises–Fisher execution noise (Alg. 1, Step 7)
