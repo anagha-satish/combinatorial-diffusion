@@ -2,6 +2,7 @@ import time
 
 import gurobipy as gp
 from gurobipy import GRB
+import numpy as np
 
 from approximator.standard_rmab_approximator import StandardRmabApproximator
 from environment.base_envs import MultiStateRMAB
@@ -12,6 +13,50 @@ class SchedulingRmabApproximator(StandardRmabApproximator):
         """ rmab: SchedulingRmab """
         super().__init__(rmab, model_type)
         self.action_dim = rmab.n_arms
+
+    # cached model + handles to action vars
+    _model = None
+    _to_pull = None  # list[gp.Var]
+
+    def _ensure_cached_model(self):
+        """Build the MIP once and cache handles to action_j variables by name."""
+        if self._model is None:
+            model = self.get_master_mip()
+            to_pull = [model.getVarByName(f"action_{j}") for j in range(self.rmab.n_arms)]
+            # sanity: make sure none are None
+            assert all(v is not None for v in to_pull), "Missing action_j vars in model."
+            self._model = model
+            self._to_pull = to_pull
+            self._model.setParam("OutputFlag", 0)
+
+    def _set_linear_objective_from_coeffs(self, c: np.ndarray):
+        """Maximize sum_j c_j * action_j."""
+        assert self._model is not None and self._to_pull is not None
+        c = np.asarray(c, dtype=float).reshape(-1)
+        assert c.shape[0] == self.rmab.n_arms, "coeff length must equal n_arms"
+        expr = gp.quicksum(float(c[j]) * self._to_pull[j] for j in range(self.rmab.n_arms))
+        self._model.setObjective(expr, GRB.MAXIMIZE)
+
+    def solve_from_coeffs(self, c: np.ndarray) -> np.ndarray:
+        """
+        Fast solve with fixed constraints: set linear objective from coeffs and optimize.
+        Returns a binary action vector of length n_arms, budget-feasible.
+        """
+        self._ensure_cached_model()
+        self._set_linear_objective_from_coeffs(c)
+        self._model.optimize()
+
+        x = np.array([int(round(v.X)) for v in self._to_pull], dtype=np.int32)
+
+        # Safety: enforce budget in case of numerical edge cases
+        if x.sum() > self.rmab.budget:
+            idx = np.argsort(c)[::-1]
+            keep = np.zeros_like(x)
+            keep[idx[: self.rmab.budget]] = 1
+            x = keep.astype(np.int32)
+
+        return x
+
 
 
     def get_master_mip(self):

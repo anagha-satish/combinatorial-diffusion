@@ -175,6 +175,10 @@ class SchedulingRMAB(StandardRMAB):
     def get_approximator(self):
         """ get MIP approximator with action constraints """
         return SchedulingRmabApproximator
+    
+    def solve_from_coeffs(self, c: np.ndarray) -> np.ndarray:
+        from approximator.scheduling_approximator import SchedulingRmabApproximator
+        return SchedulingRmabApproximator(self).solve_from_coeffs(c)
             
 
 class TorchSchedulingRMAB(SchedulingRMAB):
@@ -204,3 +208,7 @@ class TorchSchedulingRMAB(SchedulingRMAB):
     def get_constraints(self, mip):
         """ given a gurobi model, add action feasibility constraints """
         raise NotImplementedError
+    
+    def solve_from_coeffs(self, c: np.ndarray) -> np.ndarray:
+        from approximator.scheduling_approximator import SchedulingRmabApproximator
+        return SchedulingRmabApproximator(self).solve_from_coeffs(c)
