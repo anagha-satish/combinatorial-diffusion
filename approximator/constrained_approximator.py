@@ -2,6 +2,7 @@ import time
 
 import gurobipy as gp
 from gurobipy import GRB
+import numpy as np
 
 from approximator.standard_rmab_approximator import StandardRmabApproximator
 from environment.base_envs import MultiStateRMAB
@@ -13,6 +14,34 @@ class ConstrainedRmabApproximator(StandardRmabApproximator):
         """ rmab: ConstrainedRmab """
         super().__init__(rmab, model_type)
         self.action_dim = rmab.n_arms
+
+    # ---- Coefficient-based solve ----
+    def _ensure_cached_model(self):
+        """Build and cache a MIP once; keep handles to the action vars."""
+        if getattr(self, "_model", None) is None:
+            model = self.get_master_mip()
+            # pull references to the first-stage action vars p_j
+            self._to_pull = [model.getVarByName(f"action_{j}") for j in range(self.rmab.n_arms)]
+            self._model = model
+            self._model.setParam("OutputFlag", 0)
+
+    def _set_linear_objective_from_coeffs(self, c):
+        """Maximize sum_j c[j] * action_j subject to constrained feasibility."""
+        assert len(c) == self.rmab.n_arms, "coef length must equal number of arms"
+        self._model.setObjective(
+            gp.quicksum(float(c[j]) * self._to_pull[j] for j in range(self.rmab.n_arms)),
+            GRB.MAXIMIZE,
+        )
+
+    def solve_from_coeffs(self, c):
+        """Given coefficients c (Q/advantage/etc), return a feasible binary action."""
+        self._ensure_cached_model()
+        self._set_linear_objective_from_coeffs(c)
+        self._model.optimize()
+
+        # Read binary actions p_j
+        x = np.array([int(round(v.X)) for v in self._to_pull], dtype=np.int32)
+        return x
 
 
     def get_master_mip(self):
