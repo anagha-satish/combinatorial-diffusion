@@ -1,36 +1,39 @@
-# algos/repo_bridge.py
 import numpy as np
+
+try:
+    from approximator.routing_approximator import RoutingRmabApproximator
+except Exception:
+    RoutingRmabApproximator = None
+
+from environment.routing import RoutingRMAB
+from environment.scheduling import SchedulingRMAB
+from environment.constrained import ConstrainedRMAB
+from environment.multi_action import MultiActionRMAB
 
 _solver_cache = {}
 
+
 def linear_solver_approx(env):
-    key = id(env)
-    if key not in _solver_cache:
-        # Prefer the environment's advertised approximator
-        Approximator = None
-        if hasattr(env, "get_approximator"):
-            try:
-                Approximator = env.get_approximator()
-            except Exception:
-                Approximator = None
+    """
+    Return a function solve(c) that maps coefficient vector c to a feasible
+    binary action using the appropriate approximator for this env.
+    """
+    from approximator.standard_rmab_approximator import StandardRmabApproximator
+    from approximator.scheduling_approximator import SchedulingRmabApproximator
+    from approximator.constrained_approximator import ConstrainedRmabApproximator
+    from approximator.multi_action_rmab_approximator import MultiActionRmabApproximator
+    from approximator.routing_approximator import RoutingRmabApproximator
 
-        # Fallbacks by class name (very light-touch)
-        if Approximator is None:
-            # inside linear_solver_approx(env), in the fallback name-based branch:
-            name = type(env).__name__.lower()
-            try:
-                if "scheduling" in name:
-                    from approximator.scheduling_approximator import SchedulingRmabApproximator as Approximator
-                elif "constrained" in name:
-                    from approximator.constrained_approximator import ConstrainedRmabApproximator as Approximator
-                else:
-                    from approximator.routing_approximator import RoutingRmabApproximator as Approximator
-            except Exception:
-                from approximator.routing_approximator import RoutingRmabApproximator as Approximator
-
-        _solver_cache[key] = Approximator(env)
-
-    approximator = _solver_cache[key]
+    if isinstance(env, RoutingRMAB):
+        approximator = RoutingRmabApproximator(env)
+    elif isinstance(env, SchedulingRMAB):
+        approximator = SchedulingRmabApproximator(env)
+    elif isinstance(env, ConstrainedRMAB):
+        approximator = ConstrainedRmabApproximator(env)
+    elif isinstance(env, MultiActionRMAB):
+        approximator = MultiActionRmabApproximator(env)
+    else:
+        approximator = StandardRmabApproximator(env)
 
     def solve(c: np.ndarray) -> np.ndarray:
         return approximator.solve_from_coeffs(c)
