@@ -9,6 +9,8 @@ from environment.routing import RoutingRMAB
 from environment.scheduling import SchedulingRMAB
 from environment.constrained import ConstrainedRMAB
 from environment.multi_action import MultiActionRMAB
+from environment.frontier_batch_env import BinaryFrontierEnvBatch   # NEW
+# (or whatever the filename is where BinaryFrontierEnvBatch lives)
 
 _solver_cache = {}
 
@@ -23,8 +25,13 @@ def linear_solver_approx(env):
     from approximator.constrained_approximator import ConstrainedRmabApproximator
     from approximator.multi_action_rmab_approximator import MultiActionRmabApproximator
     from approximator.routing_approximator import RoutingRmabApproximator
+    from approximator.batch_graph_approximator import BatchGraphApproximator  # NEW
 
-    if isinstance(env, RoutingRMAB):
+    # ---- NEW BRANCH FOR DISEASE ENV ----
+    if isinstance(env, BinaryFrontierEnvBatch):
+        approximator = BatchGraphApproximator(env)
+
+    elif isinstance(env, RoutingRMAB):
         approximator = RoutingRmabApproximator(env)
     elif isinstance(env, SchedulingRMAB):
         approximator = SchedulingRmabApproximator(env)

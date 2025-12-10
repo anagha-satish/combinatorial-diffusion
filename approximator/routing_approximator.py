@@ -17,35 +17,80 @@ class RoutingRmabApproximator(StandardRmabApproximator):
         super().__init__(rmab, model_type)
         self.action_dim = rmab.n_arms
 
-    def _ensure_cached_model(self, with_combinatorial: bool = True):
-
-        if getattr(self, "_model", None) is None:
-            model = self.get_master_mip(with_combinatorial=with_combinatorial)
-            self._to_pull = [model.getVarByName(f"action_{j}") for j in range(self.rmab.n_arms)]
-            self._model = model
-
-            self._model.setParam("OutputFlag", 0)
-
-    def _set_linear_objective_from_coeffs(self, c: np.ndarray):
-        assert getattr(self, "_model", None) is not None, "Call _ensure_cached_model() first."
-        assert len(c) == self.rmab.n_arms
-        expr = gp.quicksum(float(c[j]) * self._to_pull[j] for j in range(self.rmab.n_arms))
-        self._model.setObjective(expr, GRB.MAXIMIZE)
-
     def solve_from_coeffs(self, c: np.ndarray) -> np.ndarray:
+        """
+        Fast, MILP-free mapping from coefficient vector c to a feasible routing action.
 
-        self._ensure_cached_model(with_combinatorial=True)
-        self._set_linear_objective_from_coeffs(c)
+        Strategy (similar to SchedulingRmabApproximator.solve_from_coeffs):
+          1) Treat c as per-arm scores.
+          2) Apply any available mask (e.g., allowed_actions_mask).
+          3) Select up to 'budget' highest-scoring indices.
+          4) Optionally project with env.project_to_feasible (if present).
 
-        self._model.optimize()
+        This avoids Gurobi entirely for the DPMD training loop.
+        """
+        c = np.asarray(c, dtype=float).reshape(-1)
 
-        x = np.array([int(round(v.X)) for v in self._to_pull], dtype=np.int32)
+        # Infer action dimension
+        act_dim = None
+        for name in ["action_dim", "n_actions", "n_arms"]:
+            if hasattr(self.rmab, name):
+                act_dim = int(getattr(self.rmab, name))
+                break
+        if act_dim is None:
+            raise RuntimeError(
+                "RoutingRmabApproximator.solve_from_coeffs: "
+                "cannot infer action dimension (looked for action_dim / n_actions / n_arms)."
+            )
 
-        if x.sum() > self.rmab.budget:
-            idx = np.argsort(c)[::-1]
-            keep = np.zeros_like(x)
-            keep[idx[: self.rmab.budget]] = 1
-            x = keep.astype(np.int32)
+        if c.shape[0] != act_dim:
+            raise ValueError(
+                f"RoutingRmabApproximator.solve_from_coeffs: "
+                f"coeff length {c.shape[0]} != action_dim {act_dim}"
+            )
+
+        # Budget (number of arms we can pull)
+        B = int(getattr(self.rmab, "budget", 1))
+
+        # Optional mask for valid actions/arms
+        mask = None
+        for name in ["allowed_actions_mask", "valid_action_mask", "allowed_mask", "action_mask"]:
+            if hasattr(self.rmab, name):
+                try:
+                    m = np.asarray(getattr(self.rmab, name)(), dtype=float).reshape(-1)
+                except TypeError:
+                    # Some envs expose the mask as an attribute instead of a callable
+                    m = np.asarray(getattr(self.rmab, name), dtype=float).reshape(-1)
+                if m.shape[0] == act_dim:
+                    mask = m
+                    break
+
+        coeffs_eff = c.copy()
+        if mask is not None:
+            # Invalidate masked-out arms by giving them a huge negative score
+            coeffs_eff[mask <= 0] = -1e9
+
+        # Greedy top-B selection
+        order = np.argsort(-coeffs_eff)
+        x = np.zeros(act_dim, dtype=float)
+        chosen = 0
+        for idx in order:
+            if chosen >= B:
+                break
+            if mask is not None and mask[idx] <= 0:
+                continue
+            x[idx] = 1.0
+            chosen += 1
+
+        # Optional projection if the env provides a helper
+        if hasattr(self.rmab, "project_to_feasible") and callable(self.rmab.project_to_feasible):
+            try:
+                x = np.asarray(self.rmab.project_to_feasible(x), dtype=float).reshape(-1)
+            except Exception as e:
+                print(
+                    "[WARN] RoutingRmabApproximator.solve_from_coeffs: "
+                    f"project_to_feasible failed with {e}, using pre-projection x."
+                )
 
         return x
 
