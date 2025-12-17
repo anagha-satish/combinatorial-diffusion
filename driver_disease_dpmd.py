@@ -346,6 +346,16 @@ def main():
         n_episodes_eval=10,
     )
 
+    np.savez(
+    f"eval_results_dpmd_{args.std_name}_seed{args.seed}.npz",
+    x=x,
+    y=y,
+    y_std=y_std
+    )
+    print("Saved eval vectors to:",
+        f"eval_results_dpmd_{args.std_name}_seed{args.seed}.npz")
+
+
     print("x shape:", x.shape)
     print("y shape:", y.shape)
     print("first few x:", x[:10])
@@ -362,7 +372,10 @@ def main():
     plt.ylim(0.0, 1.05)
     plt.legend()
     plt.tight_layout()
-    plt.savefig("disease_detection_curve_dpmd_gamma0.99.png", dpi=200)
+    plt.savefig(
+        f"{args.std_name}_dpmd_T{args.cc_threshold}_B{args.budget}_gamma{args.gamma}_seed{args.seed}.png",
+        dpi=200
+    )
     plt.show()
 
     # Discounted return summary (using training-time rewards)
