@@ -1,14 +1,10 @@
 # driver_disease_dpmd.py
 
 import argparse
-import datetime
-import io
-import os
-import sys
 import time
-import contextlib
 
 import numpy as np
+import matplotlib.pyplot as plt
 import torch
 
 from environment.disease_graph_loader import (
@@ -21,17 +17,28 @@ from algos.dpmd_experiment_rf import run_dpmd_only
 from algos.dpmd_rf import DPMDConfig
 
 
+# ------------------------------------------------------------------
+# Simple wrapper around BinaryFrontierEnvBatch
+# ------------------------------------------------------------------
+
 class DiseaseDPMDEnv:
+    """
+    Wrap BinaryFrontierEnvBatch so it looks like the env expected
+    by run_dpmd_only (obs, reward, done, info) and by the
+    BatchGraphApproximator.
+    """
+
     def __init__(self, base_env):
         self.base = base_env
 
-        # Attributes expected by run_dpmd_only
-        self.n_arms = base_env.num_nodes          # action dimension
-        self.n_actions = 1                        # dummy
+        # Attributes expected by run_dpmd_only / approximator
+        self.n_arms = base_env.num_nodes        # action dimension
+        self.n_actions = 1                      # dummy
         self.budget = base_env.budget
         self.discount_factor = base_env.discount_factor
         self.num_nodes = base_env.num_nodes
 
+    # ---- gym-like API ----
     def reset(self):
         status, mask = self.base.reset()
         self._last_mask = mask
@@ -43,7 +50,16 @@ class DiseaseDPMDEnv:
         info = {}
         return status.copy(), float(reward), bool(done), info
 
-    # For the approximator
+    # ---- properties so evaluation code can read internals ----
+    @property
+    def tests_done(self):
+        return self.base.tests_done
+
+    @property
+    def world_X(self):
+        return self.base.world_X
+
+    # ---- helpers for BatchGraphApproximator ----
     def observation(self):
         return self.base.observation()
 
@@ -64,11 +80,130 @@ class DiseaseDPMDEnv:
 def reseed_all(seed: int) -> None:
     import random
     random.seed(seed)
-    np_seed = seed % (2**32 - 1)
+    np_seed = seed % (2 ** 32 - 1)
     np.random.seed(np_seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+# ------------------------------------------------------------------
+# Detection curve evaluation
+# ------------------------------------------------------------------
+
+def evaluate_detection_curve(
+    learner,
+    env,
+    linear_solver,
+    n_episodes_eval: int = 10,
+):
+    """
+    Evaluate a trained DPMD policy on the disease environment.
+
+    Returns:
+        x: [T] mean fraction of population tested
+        y: [T] mean fraction of positive cases detected (normalized)
+        y_std: [T] std of fraction detected across episodes
+    """
+    # Number of nodes in the graph
+    n = getattr(env, "num_nodes", getattr(env, "n", None))
+    if n is None:
+        raise AttributeError("Env must have attribute `num_nodes` or `n`.")
+
+    # Per-step testing budget
+    B = int(getattr(env, "budget", 1))
+    # Enough steps to (in principle) test everyone once
+    max_steps = int(np.ceil(n / B)) + 1
+
+    all_tested = []    # [E, T]
+    all_detected = []  # [E, T]
+
+    for ep in range(n_episodes_eval):
+        reset_out = env.reset()
+        if isinstance(reset_out, tuple):
+            obs = reset_out[0]
+        else:
+            obs = reset_out
+        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+
+        cum_rewards = []
+        tested_frac = []
+        cum = 0.0
+
+        for step in range(max_steps):
+            # Greedy action from trained policy (same pattern as in run_dpmd_only)
+            Cs = learner.sample_candidates(obs, K=learner.cfg.num_particles)
+            qs = learner.score_actions(obs, Cs)
+            j = int(np.argmax(qs))
+            c_star = Cs[j]
+            action = linear_solver(c_star)
+
+            step_out = env.step(action)
+
+            # Try to interpret env.step() output robustly
+            if isinstance(step_out, tuple) and len(step_out) == 4:
+                a, b, c, d = step_out
+                # Heuristic: if 'b' looks like a mask with same shape as 'a',
+                # treat as (obs, mask, reward, done); else (obs, reward, done, info)
+                if isinstance(b, np.ndarray) and b.shape == np.asarray(a).shape:
+                    next_obs = a
+                    reward = c
+                    done = d
+                else:
+                    next_obs = a
+                    reward = b
+                    done = c
+            elif isinstance(step_out, tuple) and len(step_out) == 5:
+                # Gymnasium-style: (obs, reward, terminated, truncated, info)
+                next_obs, reward, terminated, truncated, _info = step_out
+                done = bool(terminated or truncated)
+            else:
+                # Fallback
+                try:
+                    next_obs, reward, done = step_out[0], step_out[1], step_out[2]
+                except Exception:
+                    break
+
+            cum += float(reward)
+            obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+
+            # Use env.tests_done if exposed; otherwise infer from obs
+            if hasattr(env, "tests_done"):
+                tests_done = float(env.tests_done)
+            else:
+                status = obs
+                tests_done = float(np.count_nonzero(status > -0.5))
+
+            tested_frac.append(tests_done / float(n))
+            cum_rewards.append(cum)
+
+            if done:
+                break
+
+        if len(cum_rewards) == 0:
+            cum_rewards = [0.0]
+            tested_frac = [0.0]
+
+        # Total positives in this world = final cumulative reward
+        total_pos = max(cum_rewards[-1], 1.0)
+        detected_frac = [cr / total_pos for cr in cum_rewards]
+
+        # Pad to max_steps so we can average across episodes
+        while len(tested_frac) < max_steps:
+            tested_frac.append(tested_frac[-1])
+            detected_frac.append(detected_frac[-1])
+
+        all_tested.append(tested_frac)
+        all_detected.append(detected_frac)
+
+    all_tested = np.array(all_tested)     # [E, T]
+    all_detected = np.array(all_detected) # [E, T]
+
+    x = all_tested.mean(axis=0)
+    y = all_detected.mean(axis=0)
+    y_std = all_detected.std(axis=0)
+
+    return x, y, y_std
 
 
 # ------------------------------------------------------------------
@@ -101,7 +236,7 @@ def main():
     parser.add_argument('--delay_update', type=int, default=2)
     parser.add_argument('--reward_scale', type=float, default=1.0)
 
-    # DPMD / RFM hyperparams (same as routing driver)
+    # DPMD / RFM hyperparams
     parser.add_argument('--lr', type=float, default=4e-4)
     parser.add_argument('--num_particles', type=int, default=12)
 
@@ -148,11 +283,10 @@ def main():
     base_env = create_disease_env(
         G, covariates, theta_unary, theta_pairwise,
         budget=args.budget,
-        discount_factor=args.gamma,  # same gamma
+        discount_factor=args.gamma,
         rng_seed=args.seed,
     )
 
-    # Wrap for DPMD
     env = DiseaseDPMDEnv(base_env)
     horizon = base_env.n
     print(f'environment: n={base_env.n}, budget={base_env.budget}')
@@ -189,7 +323,8 @@ def main():
     print('--------------------------------------------------------')
 
     t0 = time.time()
-    rewards = run_dpmd_only(
+    # IMPORTANT: run_dpmd_only must return (rewards_array, learner)
+    rewards, learner = run_dpmd_only(
         env,
         horizon=horizon,
         budget=args.budget,
@@ -203,17 +338,45 @@ def main():
     )
     elapsed = time.time() - t0
 
-    # Simple scalar metric
+    # Detection curve for the trained policy
+    x, y, y_std = evaluate_detection_curve(
+        learner,
+        env,
+        linear_solver,
+        n_episodes_eval=10,
+    )
+
+    print("x shape:", x.shape)
+    print("y shape:", y.shape)
+    print("first few x:", x[:10])
+    print("first few y:", y[:10])
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, y, linestyle="--", color="tab:blue", label="DPMD-RF")
+    plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
+    plt.axvline(x=0.5, linestyle="--", color="gray", alpha=0.7)
+    plt.xlabel("Fraction of population tested")
+    plt.ylabel("Fraction of positive cases detected (normalized)")
+    plt.title("Policies with discount = 0.99")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.05)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig("disease_detection_curve_dpmd_gamma0.99.png", dpi=200)
+    plt.show()
+
+    # Discounted return summary (using training-time rewards)
     gamma = args.gamma
-    disc_returns = []
-    steps_per_ep = horizon
     rewards = np.asarray(rewards, dtype=float)
+    steps_per_ep = horizon
     if rewards.size > 0:
         rewards = rewards.reshape(-1, steps_per_ep)
         discounts = gamma ** np.arange(steps_per_ep)
         disc_returns = (rewards * discounts[None, :]).sum(axis=1)
+    else:
+        disc_returns = np.array([])
 
-    if len(disc_returns) > 0:
+    if disc_returns.size > 0:
         mean_disc = float(np.mean(disc_returns))
         std_disc = float(np.std(disc_returns))
     else:
@@ -224,7 +387,7 @@ def main():
     print('Results')
     print('--------------------------------------------------------')
     print(f'{args.std_name} disease testing | n={base_env.n}, budget={args.budget}, gamma={gamma}')
-    print(f'  episodes: {len(disc_returns)}, mean discounted return = {mean_disc:.4f}, std = {std_disc:.4f}')
+    print(f'  episodes: {disc_returns.size}, mean discounted return = {mean_disc:.4f}, std = {std_disc:.4f}')
     print(f'  runtime: {elapsed:.2f} seconds')
     print('[done]')
 

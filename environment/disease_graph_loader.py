@@ -54,7 +54,7 @@ def load_disease_graph_instance(
     std_name: str,
     cc_threshold: int,
     inst_idx: int,
-    filter_sex_only: bool = True
+    filter_sex_only: bool = False
 ) -> Tuple[nx.Graph, dict, np.ndarray, np.ndarray, dict]:
     """
     Load and process disease graph from ICPSR data.

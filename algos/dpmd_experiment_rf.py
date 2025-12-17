@@ -240,4 +240,4 @@ def run_dpmd_only(
                 rewards_all.extend([0.0] * (horizon - t - 1))  # pad episode length
                 break
 
-    return np.asarray(rewards_all, dtype=np.float32)
+    return np.asarray(rewards_all, dtype=np.float32), learner

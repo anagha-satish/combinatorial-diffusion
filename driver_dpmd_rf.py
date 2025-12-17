@@ -166,7 +166,7 @@ def main():
 
 
     t0 = time.time()
-    rewards = run_dpmd_only(
+    rewards, learner = run_dpmd_only(
         env,
         horizon=args.horizon,
         budget=args.budget,
