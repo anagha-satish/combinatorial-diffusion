@@ -157,7 +157,8 @@ class DPMD:
     def pretrain_critics_step(self, batch: Experience, *, huber_delta: float = 5.0) -> float:
         """One supervised step for critics using *myopic* targets (gamma=0): y = r."""
         obs      = _fit_width(_to_tensor(batch.obs,      self.device), self.obs_dim)
-        act_exec = _to_tensor(batch.action,  self.device)
+        c_clean = _to_tensor(batch.action_star, self.device)
+
         rew      = _to_tensor(batch.reward,  self.device).view(-1)  # target
 
         def huber(a, b, delta=huber_delta):
@@ -166,8 +167,8 @@ class DPMD:
             return torch.where(ax < delta, 0.5*x*x, delta*(ax - 0.5*delta)).mean()
 
         self.q_optim.zero_grad(set_to_none=True)
-        q1_loss = huber(self.q1(obs, act_exec), rew)
-        q2_loss = huber(self.q2(obs, act_exec), rew)
+        q1_loss = huber(self.q1(obs, c_clean), rew)
+        q2_loss = huber(self.q2(obs, c_clean), rew)
         (q1_loss + q2_loss).backward()
         torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
         self.q_optim.step()
@@ -226,46 +227,38 @@ class DPMD:
         return float((1.0 - s) * self.cfg.lambda_start + s * self.cfg.lambda_end)
 
     @torch.no_grad()
-    def _weights_from_hatc(
+    def _weights_no_smooth(
         self,
-        s_old: Tensor,          # [B, F]
-        c1: Tensor,             # [B, D]  (replay: action_star ~ π_old)
+        s_old: Tensor,   # [B, F]
+        c1: Tensor,      # [B, D]
         *,
-        J: int,
-        kappa: float,
         lam: float,
         w_clip: Optional[float] = None,
     ) -> Tensor:
         """
-        Compute per-sample MD weights using target critics on vMF-perturbed \hat c.
+        MD weights w(s,c1) using target critics evaluated at c1 (NO vMF perturbation),
+        but KEEP the original EMA + batch normalization for stability.
         """
-        B = s_old.shape[0]
-        # vMF J-perturbations per sample -> [B, J, D]
-        hatc_np = rfm_service.perturb(c1.detach().cpu().numpy(), kappa=kappa, J=J)
-        hatc = torch.as_tensor(hatc_np, device=self.device, dtype=torch.float32)
+        # 1) Score with target critics at c1 (no smoothing)
+        tq1 = self.tq1(s_old, c1)
+        tq2 = self.tq2(s_old, c1)
+        q = torch.minimum(tq1, tq2)  # [B], raw values
 
+        # 2) Update running stats on RAW q (important!)
+        q_mean_batch = q.mean()
+        q_std_batch  = q.std() + 1e-6
 
-        # score with target critics
-        rep_obs = s_old.unsqueeze(1).expand(B, J, self.obs_dim).reshape(B * J, self.obs_dim)
-        flat_hatc = hatc.reshape(B * J, self.act_dim)
-        tq1 = self.tq1(rep_obs, flat_hatc).view(B, J)
-        tq2 = self.tq2(rep_obs, flat_hatc).view(B, J)
-        qmin_hat = torch.minimum(tq1, tq2).mean(dim=1)  # [B]
-        qmin_hat = qmin_hat - qmin_hat.mean() # center for stability
+        self._q_mean = (1 - self.cfg.q_running_beta) * self._q_mean + self.cfg.q_running_beta * float(q_mean_batch)
+        self._q_std  = (1 - self.cfg.q_running_beta) * self._q_std  + self.cfg.q_running_beta * float(q_std_batch)
 
-        # running stats
-        self._q_mean = (1 - self.cfg.q_running_beta) * self._q_mean + self.cfg.q_running_beta * float(qmin_hat.mean())
-        self._q_std  = (1 - self.cfg.q_running_beta) * self._q_std  + self.cfg.q_running_beta * float(qmin_hat.std() + 1e-6)
-        q_norm_ema = (qmin_hat - self._q_mean) / (self._q_std + 1e-6)
+        # 3) Normalize (EMA z-score and batch z-score), then blend+clip (same spirit as your code)
+        q_norm_ema   = (q - self._q_mean) / (self._q_std + 1e-6)
+        q_norm_batch = (q - q_mean_batch) / q_std_batch
 
-        # quick batch z-score (guards early training)
-        q_norm_batch = (qmin_hat - qmin_hat.mean()) / (qmin_hat.std() + 1e-6)
-
-        # blend and clip
         q_norm = 0.5 * q_norm_ema + 0.5 * q_norm_batch
         q_norm = torch.clamp(q_norm, -self.cfg.q_norm_clip, self.cfg.q_norm_clip)
 
-        # MD weights on normalized \hat c
+        # 4) Convert to weights
         alpha = torch.exp(self.log_alpha).detach()
         lam = max(float(lam), 1e-6)
         logits = (alpha * q_norm) / lam
@@ -273,8 +266,8 @@ class DPMD:
         w = torch.exp(logits)
         if w_clip is not None:
             w = torch.clamp(w, max=float(w_clip))
-
         return w
+
 
     # -----------------------------
     # Smoothed Bellman target V^b_κ(s')
@@ -320,7 +313,7 @@ class DPMD:
     def update(self, batch: Experience) -> Dict[str, float]:
         # Parse batch
         obs      = _fit_width(_to_tensor(batch.obs,      self.device), self.obs_dim)
-        act_exec = _to_tensor(batch.action,  self.device)
+        c_clean = _to_tensor(batch.action_star, self.device)  # clean center c
         rew      = _to_tensor(batch.reward,  self.device).view(-1)
         nxt      = _fit_width(_to_tensor(batch.next_obs, self.device), self.obs_dim)
         done     = _to_tensor(batch.done,    self.device).view(-1)
@@ -340,24 +333,27 @@ class DPMD:
             return torch.where(absx < delta, 0.5*x*x, delta*(absx - 0.5*delta)).mean()
 
         self.q_optim.zero_grad(set_to_none=True)
-        q1_loss = huber(self.q1(obs, act_exec), y, delta=5.0)
-        q2_loss = huber(self.q2(obs, act_exec), y, delta=5.0)
+        q1_loss = huber(self.q1(obs, c_clean), y, delta=5.0)
+        q2_loss = huber(self.q2(obs, c_clean), y, delta=5.0)
+            
         (q1_loss + q2_loss).backward()
         torch.nn.utils.clip_grad_norm_(list(self.q1.parameters())+list(self.q2.parameters()), 10.0)
         self.q_optim.step()
 
-        # 3) Actor update using π_old samples from replay with MD weights on vMF-perturbed \hat c
+        # 3) Actor update: sample states from replay, sample c from target actor compute MD weights from target critics (no smoothing), then update online actor.”
         with torch.no_grad():
             s_old = _fit_width(_to_tensor(batch.obs, self.device), self.obs_dim)      # [B, F]
-            c1    = _to_tensor(batch.action_star, self.device)                         # [B, D]
+            # sample c1 ~ pi_old(.|s) using target actor
+            C1 = self._sample_candidates(s_old, K=1, use_target=True)  # [B,1,D]
+            c1 = C1[:, 0, :]                                           # [B,D]
+                       # [B, D]
             # weights on \hat c using target critics
-            w = self._weights_from_hatc(
+            w = self._weights_no_smooth(
                 s_old, c1,
-                J=int(self.cfg.J_smooth),
-                kappa=float(self.cfg.kappa_smooth),
                 lam=float(self._current_lambda()),
                 w_clip=self.cfg.w_clip
-            )  # [B]
+            )
+
 
         # Train RFM actor on (s, c1, w)
         policy_loss = rfm_service.update(
