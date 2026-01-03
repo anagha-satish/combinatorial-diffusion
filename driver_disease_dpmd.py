@@ -6,6 +6,7 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
+import os
 
 from environment.disease_graph_loader import (
     load_disease_graph_instance,
@@ -13,9 +14,8 @@ from environment.disease_graph_loader import (
 )
 from approximator.batch_graph_approximator import BatchGraphApproximator
 
-from algos.dpmd_experiment_rf import run_dpmd_only
-from algos.dpmd_rf import DPMDConfig
-
+from algos.dpmd_experiment_rf_disease_gnn import run_dpmd_rf_disease_gnn
+from algos.dpmd_rf_disease_gnn import DPMDGraphConfig
 
 # ------------------------------------------------------------------
 # Simple wrapper around BinaryFrontierEnvBatch
@@ -298,7 +298,7 @@ def main():
         return approximator.solve_from_coeffs(c)
 
     # DPMD config
-    cfg = DPMDConfig(
+    cfg = DPMDGraphConfig(
         gamma=args.gamma,
         lr=args.lr,
         tau=args.tau,
@@ -310,7 +310,6 @@ def main():
         kappa_smooth=args.kappa_smooth,
         M_smooth=args.M_smooth,
         J_smooth=args.J_smooth,
-        flow_steps=args.flow_steps,
         lambda_start=args.lambda_start,
         lambda_end=args.lambda_end,
         lambda_steps=args.lambda_steps,
@@ -324,7 +323,7 @@ def main():
 
     t0 = time.time()
     # IMPORTANT: run_dpmd_only must return (rewards_array, learner)
-    rewards, learner = run_dpmd_only(
+    rewards, learner = run_dpmd_rf_disease_gnn(
         env,
         horizon=horizon,
         budget=args.budget,
@@ -346,21 +345,40 @@ def main():
         n_episodes_eval=10,
     )
 
-    np.savez(
-    f"eval_results_dpmd_{args.std_name}_seed{args.seed}.npz",
-    x=x,
-    y=y,
-    y_std=y_std
+    # ------------------------------------------------------------------
+    # Ensure results directory exists
+    # ------------------------------------------------------------------
+    os.makedirs("results", exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Unique run tag for sweeps (already correct)
+    # ------------------------------------------------------------------
+    run_tag = (
+        f"{args.std_name}"
+        f"_T{args.cc_threshold}"
+        f"_B{args.budget}"
+        f"_gamma{args.gamma}"
+        f"_seed{args.seed}"
+        f"_train{args.train_updates}"
+        f"_flow{args.flow_steps}"
+        f"_K{args.num_particles}"
     )
-    print("Saved eval vectors to:",
-        f"eval_results_dpmd_{args.std_name}_seed{args.seed}.npz")
 
+    # ------------------------------------------------------------------
+    # Save evaluation vectors (unique per sweep run)
+    # ------------------------------------------------------------------
+    npz_path = f"results/eval_results_{run_tag}.npz"
+    np.savez(
+        npz_path,
+        x=x,
+        y=y,
+        y_std=y_std
+    )
+    print("Saved eval vectors to:", npz_path)
 
-    print("x shape:", x.shape)
-    print("y shape:", y.shape)
-    print("first few x:", x[:10])
-    print("first few y:", y[:10])
-
+    # ------------------------------------------------------------------
+    # Plot detection curve (unique per sweep run)
+    # ------------------------------------------------------------------
     plt.figure(figsize=(8, 4))
     plt.plot(x, y, linestyle="--", color="tab:blue", label="DPMD-RF")
     plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
@@ -372,11 +390,13 @@ def main():
     plt.ylim(0.0, 1.05)
     plt.legend()
     plt.tight_layout()
-    plt.savefig(
-        f"{args.std_name}_dpmd_T{args.cc_threshold}_B{args.budget}_gamma{args.gamma}_seed{args.seed}.png",
-        dpi=200
-    )
-    plt.show()
+
+    png_path = f"results/disease_detection_curve_{run_tag}.png"
+    plt.savefig(png_path, dpi=200)
+    print("Saved plot to:", png_path)
+    plt.close()
+
+
 
     # Discounted return summary (using training-time rewards)
     gamma = args.gamma

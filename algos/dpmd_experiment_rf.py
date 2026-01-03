@@ -141,8 +141,9 @@ def run_dpmd_only(
             next_obs = _flat(next_obs)
             r_scalar = float(np.sum(rew)) if isinstance(rew, (list, np.ndarray)) else float(rew)
 
-            buffer.add(obs, c_exec, r_scalar, next_obs, float(done),
-                       coeff_star=c_star, policy_id=learner.policy_version)
+            # Store CLEAN c (critic input) in replay
+            buffer.add(obs, c_star, r_scalar, next_obs, float(done),
+                    coeff_star=c_star, policy_id=learner.policy_version)
 
             obs = next_obs
             steps_collected += 1
@@ -191,8 +192,8 @@ def run_dpmd_only(
             r_scalar = float(np.sum(rew)) if isinstance(rew, (list, np.ndarray)) else float(rew)
 
             # push transition
-            buffer.add(obs, c_exec, r_scalar, next_obs, float(done),
-                       coeff_star=c_star, policy_id=learner.policy_version)
+            buffer.add(obs, c_star, r_scalar, next_obs, float(done),
+                    coeff_star=c_star, policy_id=learner.policy_version)
 
             # one update per step
             MIN_WARM_BATCHES = 3 * batch_size
