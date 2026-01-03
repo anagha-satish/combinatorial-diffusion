@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, NamedTuple, Dict, Tuple
+from typing import Optional, NamedTuple, Dict
 
 import numpy as np
 import torch
@@ -11,22 +11,22 @@ import torch.optim as optim
 import torch.nn.functional as F
 from torch import Tensor
 
-from torch_geometric.nn import GINEConv, global_mean_pool
 from torch_geometric.data import Data, Batch
+from torch_geometric.nn import GINEConv, global_mean_pool
 
-from models.rfm.service import rfm_service
+from models.rfm.service_gnn import rfm_service_gnn
 
 
 # -----------------------------
 # Replay experience tuple
 # -----------------------------
 class Experience(NamedTuple):
-    obs:         np.ndarray  # [B, F]   (GNN pooled embedding z(s))
-    action:      np.ndarray  # [B, D]   executed coefficient c_exec (stored in replay)
+    obs:         np.ndarray  # [B, n]  status
+    action:      np.ndarray  # [B, n]  executed coefficient c_exec (stored in replay)
     reward:      np.ndarray  # [B]
-    next_obs:    np.ndarray  # [B, F]   next embedding z(s')
+    next_obs:    np.ndarray  # [B, n]  next status
     done:        np.ndarray  # [B]
-    action_star: np.ndarray  # [B, D]   greedy center coefficient c*
+    action_star: np.ndarray  # [B, n]  greedy center coefficient c*
     policy_id:   np.ndarray  # [B]
 
 
@@ -71,12 +71,13 @@ class DPMDGraphConfig:
     # diffusion/flow steps
     flow_steps: int = 36
 
-    # ---- GNN encoder ----
+    # ---- graph feature dims ----
     node_in_dim: int = 3        # [unary(2), status(1)]
     edge_in_dim: int = 4        # pairwise factor flattened
-    gnn_hidden: int = 64
-    gnn_layers: int = 2
-    emb_dim: int = 64           # pooled z(s) dim; keep = gnn_hidden for simplicity
+
+    # ---- critic GNN ----
+    q_hidden: int = 128
+    q_layers: int = 3
 
 
 # -----------------------------
@@ -91,82 +92,99 @@ def _to_tensor(x, device, dtype=torch.float32) -> Tensor:
         return torch.tensor(x, device=device, dtype=dtype)
     return torch.as_tensor(x, device=device, dtype=dtype)
 
-def _fit_width(x: Tensor, target_F: int) -> Tensor:
-    if x.dim() == 1:
-        x = x.unsqueeze(0)
-    if x.dim() >= 3:
-        x = x.view(x.shape[0], -1)
-    F = x.shape[-1]
-    if F == target_F:
-        return x
-    if F > target_F:
-        return x[:, :target_F].contiguous()
-    pad = torch.zeros(x.shape[0], target_F - F, device=x.device, dtype=x.dtype)
-    return torch.cat([x, pad], dim=-1)
+
+def _repeat_batch(batch: Batch, K: int) -> Batch:
+    """Repeat a Batch of B graphs into a Batch of (B*K) graphs."""
+    if K <= 1:
+        return batch
+    data_list = batch.to_data_list()
+    rep = data_list * int(K)
+    return Batch.from_data_list(rep).to(batch.x.device)
+
+
+def _node_local_index(batch: Batch) -> Tensor:
+    """Per-node local index within its graph: [num_nodes_total]."""
+    idx = torch.arange(batch.num_nodes, device=batch.x.device)
+    return idx - batch.ptr[batch.batch]
 
 
 # -----------------------------
-# GNN state encoder z(s)
+# Critic Q(batch_graph, c): GNN
 # -----------------------------
-class GraphStateEncoder(nn.Module):
+class GraphQNet(nn.Module):
     """
-    Encodes (graph structure + unary/pairwise params + current status) into a pooled embedding z(s).
+    Q(s,c) as a GNN:
+      - node feature = base([unary2,status1]) concat c_scalar (1)
+      - GINE layers
+      - global mean pool -> MLP -> scalar Q per graph
     """
-    def __init__(self, node_in_dim: int, edge_in_dim: int, hidden: int, layers: int = 2):
+    def __init__(self, node_base_dim: int, edge_in_dim: int, hidden: int = 128, layers: int = 3):
         super().__init__()
+        self.node_base_dim = int(node_base_dim)
+        self.edge_in_dim = int(edge_in_dim)
+        self.hidden = int(hidden)
+
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
         )
+
+        node_in = self.node_base_dim + 1  # + c_scalar
         self.convs = nn.ModuleList()
-        for i in range(layers):
+        for i in range(int(layers)):
             mlp = nn.Sequential(
-                nn.Linear(hidden if i > 0 else node_in_dim, hidden),
-                nn.ReLU(),
+                nn.Linear(hidden if i > 0 else node_in, hidden),
+                nn.SiLU(),
                 nn.Linear(hidden, hidden),
             )
             self.convs.append(GINEConv(nn=mlp, edge_dim=hidden))
-        self.out = nn.Identity()
 
-    def forward(self, batch: Batch) -> Tensor:
-        x, edge_index, edge_attr, batch_idx = batch.x, batch.edge_index, batch.edge_attr, batch.batch
-        e = self.edge_mlp(edge_attr)
-        for conv in self.convs:
-            x = F.relu(conv(x, edge_index, e))
-        z = global_mean_pool(x, batch_idx)  # [B, hidden]
-        return self.out(z)
-
-
-# -----------------------------
-# Critic Q(z(s), c): MLP on concat
-# -----------------------------
-class QNet(nn.Module):
-    def __init__(self, obs_dim: int, act_dim: int, hidden=(256, 256)):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(obs_dim + act_dim, hidden[0]), nn.ReLU(),
-            nn.Linear(hidden[0], hidden[1]), nn.ReLU(),
-            nn.Linear(hidden[1], 1),
+        self.head = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.SiLU(),
+            nn.Linear(hidden, 1),
         )
 
-    def forward(self, obs: Tensor, act: Tensor) -> Tensor:
-        return self.net(torch.cat([obs, act], dim=-1)).squeeze(-1)
+    def forward(self, batch: Batch, c: Tensor) -> Tensor:
+        """
+        batch: Batch with B graphs
+        c:     [B, n_nodes] coefficient vector
+        returns: [B] Q values
+        """
+        assert c.dim() == 2, "c must be [B, D]"
+        B = int(batch.num_graphs)
+        D = int(c.shape[1])
+
+        # broadcast c to nodes via (batch_id, local_node_id)
+        local_idx = _node_local_index(batch)                          # [num_nodes_total]
+        c_scalar = c[batch.batch, local_idx].unsqueeze(-1)            # [num_nodes_total,1]
+
+        x = torch.cat([batch.x, c_scalar], dim=-1)                    # [num_nodes_total, node_in]
+        e = self.edge_mlp(batch.edge_attr)                            # [num_edges_total, hidden]
+
+        h = x
+        for conv in self.convs:
+            h = F.silu(conv(h, batch.edge_index, e))
+
+        pooled = global_mean_pool(h, batch.batch)                     # [B, hidden]
+        q = self.head(pooled).squeeze(-1)                             # [B]
+        assert q.shape[0] == B
+        return q
 
 
 # -----------------------------
 # Disease DPMD-RF with:
-#   - GNN encoder producing z(s)
-#   - diffusion actor via rfm_service on z(s)
-#   - twin MLP critics on (z(s), c)
+#   - actor: RFMPolicyGNN via rfm_service_gnn
+#   - critics: twin GraphQNet on (Batch, c)
 # -----------------------------
 class DPMDGraphDisease:
     def __init__(
         self,
         n_nodes: int,
-        node_covariates: np.ndarray,    # [n,2] unary factors flattened
-        edge_index: np.ndarray,         # [2, E_dir]
-        edge_attr: np.ndarray,          # [E_dir, 4]
+        node_covariates: np.ndarray,  # [n,2]
+        edge_index: np.ndarray,       # [2, E_dir]
+        edge_attr: np.ndarray,        # [E_dir, 4]
         *,
         device: Optional[torch.device] = None,
         cfg: DPMDGraphConfig = DPMDGraphConfig(),
@@ -174,38 +192,24 @@ class DPMDGraphDisease:
         self.cfg = cfg
         self.n = int(n_nodes)
         self.act_dim = self.n
-        self.obs_dim = int(cfg.emb_dim)
 
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # --- static graph tensors on device ---
+        # static graph tensors
         assert node_covariates.shape == (self.n, 2)
         self.node_cov = torch.tensor(node_covariates, dtype=torch.float32, device=self.device)  # [n,2]
-        self.edge_index = torch.tensor(edge_index, dtype=torch.long, device=self.device)       # [2,E]
-        self.edge_attr = torch.tensor(edge_attr, dtype=torch.float32, device=self.device)      # [E,4]
+        self.edge_index = torch.tensor(edge_index, dtype=torch.long, device=self.device)        # [2,E]
+        self.edge_attr = torch.tensor(edge_attr, dtype=torch.float32, device=self.device)       # [E,4]
 
-        # --- encoder ---
-        self.encoder = GraphStateEncoder(
-            node_in_dim=cfg.node_in_dim,
-            edge_in_dim=cfg.edge_in_dim,
-            hidden=cfg.gnn_hidden,
-            layers=cfg.gnn_layers,
-        ).to(self.device)
-
-        # If emb_dim != gnn_hidden, add a projection
-        self.proj = nn.Linear(cfg.gnn_hidden, cfg.emb_dim).to(self.device) if cfg.gnn_hidden != cfg.emb_dim else nn.Identity()
-
-        # --- critics + targets ---
-        self.q1 = QNet(self.obs_dim, self.act_dim).to(self.device)
-        self.q2 = QNet(self.obs_dim, self.act_dim).to(self.device)
-        self.tq1 = QNet(self.obs_dim, self.act_dim).to(self.device)
-        self.tq2 = QNet(self.obs_dim, self.act_dim).to(self.device)
+        # critics + targets
+        self.q1 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
+        self.q2 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
+        self.tq1 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
+        self.tq2 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
         self.tq1.load_state_dict(self.q1.state_dict())
         self.tq2.load_state_dict(self.q2.state_dict())
 
-        # critic optimizer ALSO trains encoder
         self.q_optim = optim.Adam(
-            list(self.encoder.parameters()) + list(self.proj.parameters()) +
             list(self.q1.parameters()) + list(self.q2.parameters()),
             lr=cfg.lr
         )
@@ -221,69 +225,62 @@ class DPMDGraphDisease:
         self.alpha_optim = optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
 
         # keep target actor aligned initially
-        if hasattr(rfm_service, "sync_target_from_current"):
-            rfm_service.sync_target_from_current()
+        if hasattr(rfm_service_gnn, "sync_target_from_current"):
+            rfm_service_gnn.sync_target_from_current()
 
     # ------------------------------------------------------------------
-    # Graph -> embedding
+    # Build Batch from status
     # ------------------------------------------------------------------
     def _data_from_status(self, status: np.ndarray) -> Data:
         status_feat = torch.tensor(status.astype(np.float32), device=self.device).view(self.n, 1)
         x = torch.cat([self.node_cov, status_feat], dim=1)  # [n,3]
         return Data(x=x, edge_index=self.edge_index, edge_attr=self.edge_attr)
 
-    def encode_status_batch(self, status_batch: np.ndarray) -> Tensor:
-        """
-        status_batch: [B,n] float32
-        returns: z [B, emb_dim]
-        """
+    def batch_from_status_batch(self, status_batch: np.ndarray) -> Batch:
         datas = [self._data_from_status(s) for s in status_batch]
-        batch = Batch.from_data_list(datas).to(self.device)
-        z = self.encoder(batch)
-        z = self.proj(z)
-        return z
-
-    def encode_status(self, status: np.ndarray) -> np.ndarray:
-        with torch.no_grad():
-            z = self.encode_status_batch(status.reshape(1, -1)).detach().cpu().numpy()[0]
-        return z.astype(np.float32, copy=False)
+        return Batch.from_data_list(datas).to(self.device)
 
     # ------------------------------------------------------------------
-    # Diffusion policy on z(s)
+    # Actor sampling
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _sample_candidates(self, z: Tensor, K: int, *, use_target: bool = False) -> Tensor:
-        z = _fit_width(z, self.obs_dim)
-        if use_target and hasattr(rfm_service, "sample_target"):
-            C_np = rfm_service.sample_target(
-                obs_np=z.detach().cpu().numpy(),
+    def _sample_candidates(self, batch: Batch, K: int, *, use_target: bool = False) -> Tensor:
+        if use_target:
+            C_np = rfm_service_gnn.sample_target(
+                batch=batch,
                 K=K,
                 steps=self.cfg.flow_steps,
                 kappa=None,
-                J_noise=1
+                J_noise=1,
             )
         else:
-            C_np = rfm_service.sample(
-                obs_np=z.detach().cpu().numpy(),
+            C_np = rfm_service_gnn.sample(
+                batch=batch,
                 K=K,
                 steps=self.cfg.flow_steps,
                 kappa=None,
-                J_noise=1
+                J_noise=1,
             )
         return _to_tensor(C_np, self.device)  # [B,K,D]
 
     @torch.no_grad()
     def sample_candidates(self, obs_status: np.ndarray, K: int, *, use_target: bool = False) -> np.ndarray:
-        z = torch.tensor(self.encode_status(obs_status).reshape(1, -1), device=self.device, dtype=torch.float32)
-        C = self._sample_candidates(z, K=K, use_target=use_target)[0]  # [K,D]
+        batch = self.batch_from_status_batch(obs_status.reshape(1, -1))
+        C = self._sample_candidates(batch, K=K, use_target=use_target)[0]  # [K,D]
         return C.detach().cpu().numpy().astype(np.float32, copy=False)
 
     @torch.no_grad()
     def score_actions(self, obs_status: np.ndarray, C: np.ndarray) -> np.ndarray:
-        z = torch.tensor(self.encode_status(obs_status).reshape(1, -1), device=self.device, dtype=torch.float32)
-        c = torch.tensor(C, device=self.device, dtype=torch.float32)
-        z_rep = z.repeat(c.shape[0], 1)
-        q = torch.minimum(self.q1(z_rep, c), self.q2(z_rep, c))
+        """
+        obs_status: [n]
+        C: [K,D]
+        returns q: [K]
+        """
+        batch = self.batch_from_status_batch(obs_status.reshape(1, -1))  # 1 graph
+        K = int(C.shape[0])
+        batchK = _repeat_batch(batch, K)                                  # K graphs
+        c = _to_tensor(C, self.device)                                    # [K,D]
+        q = torch.minimum(self.q1(batchK, c), self.q2(batchK, c))          # [K]
         return q.detach().cpu().numpy()
 
     # ------------------------------------------------------------------
@@ -294,10 +291,8 @@ class DPMDGraphDisease:
         return float((1.0 - s) * self.cfg.lambda_start + s * self.cfg.lambda_end)
 
     @torch.no_grad()
-    def _weights_no_smooth(self, z_old: Tensor, c1: Tensor, lam: float) -> Tensor:
-        tq1 = self.tq1(z_old, c1)
-        tq2 = self.tq2(z_old, c1)
-        q = torch.minimum(tq1, tq2)
+    def _weights_no_smooth(self, batch_old: Batch, c1: Tensor, lam: float) -> Tensor:
+        q = torch.minimum(self.tq1(batch_old, c1), self.tq2(batch_old, c1))  # [B]
 
         q_mean_batch = q.mean()
         q_std_batch = q.std() + 1e-6
@@ -317,41 +312,50 @@ class DPMDGraphDisease:
 
         if self.cfg.w_clip is not None:
             w = torch.clamp(w, max=float(self.cfg.w_clip))
-        return w
+        return w  # [B]
 
     @torch.no_grad()
-    def _smoothed_value(self, z_next: Tensor) -> Tensor:
-        z_next = _fit_width(z_next, self.obs_dim)
-        B = z_next.shape[0]
+    def _smoothed_value(self, batch_next: Batch) -> Tensor:
+        """
+        Smoothed V(s') computed via sampling target actor + vMF noise and target critics.
+        returns: [B]
+        """
+        B = int(batch_next.num_graphs)
         M = max(1, int(self.cfg.M_smooth))
         J = max(1, int(self.cfg.J_smooth))
         kappa = float(self.cfg.kappa_smooth)
 
-        Cprime = self._sample_candidates(z_next, M, use_target=True)  # [B,M,D]
-        cm = Cprime.reshape(B * M, self.act_dim)
-        cm_tilde = rfm_service.perturb(cm.detach().cpu().numpy(), kappa=kappa, J=J)  # [B*M,J,D]
+        # Cprime: [B,M,D]
+        Cprime = self._sample_candidates(batch_next, M, use_target=True)
+        cm = Cprime.reshape(B * M, self.act_dim)  # [B*M,D]
+
+        # vMF noise around each candidate
+        cm_tilde = rfm_service_gnn.perturb(cm.detach().cpu().numpy(), kappa=kappa, J=J)  # [B*M,J,D]
         Chat = _to_tensor(cm_tilde, self.device).reshape(B, M, J, self.act_dim)
 
-        rep_z = z_next.view(B, 1, 1, self.obs_dim).expand(B, M, J, self.obs_dim).reshape(B*M*J, self.obs_dim)
-        flat_c = Chat.reshape(B*M*J, self.act_dim)
+        # Evaluate target critics on (B*M*J) repeated graphs
+        batch_rep = _repeat_batch(batch_next, M * J)                 # [B*M*J graphs]
+        flat_c = Chat.reshape(B * M * J, self.act_dim)               # [B*M*J,D]
 
-        q1 = self.tq1(rep_z, flat_c).view(B, M, J)
-        q2 = self.tq2(rep_z, flat_c).view(B, M, J)
+        q1 = self.tq1(batch_rep, flat_c).view(B, M, J)
+        q2 = self.tq2(batch_rep, flat_c).view(B, M, J)
         qmin = torch.minimum(q1, q2)
 
-        qflat = qmin.view(B, -1)
+        qflat = qmin.view(B, -1)  # [B, M*J]
         ktrim = int(0.2 * qflat.shape[1])
         vals, _ = torch.sort(qflat, dim=1, descending=True)
         Vb = vals[:, :-ktrim].mean(dim=1) if ktrim > 0 else vals.mean(dim=1)
-        return Vb
+        return Vb  # [B]
 
     # -----------------------------------------------------
     # Pretrain critics (myopic): y=r
     # -----------------------------------------------------
     def pretrain_critics_step(self, batch: Experience, huber_delta: float = 5.0) -> float:
-        z = _fit_width(_to_tensor(batch.obs, self.device), self.obs_dim)
-        c_clean = _to_tensor(batch.action_star, self.device)
-        y = _to_tensor(batch.reward, self.device).view(-1)
+        s = _to_tensor(batch.obs, self.device)               # [B,n]
+        c_clean = _to_tensor(batch.action_star, self.device) # [B,n]
+        y = _to_tensor(batch.reward, self.device).view(-1)   # [B]
+
+        batch_graph = self.batch_from_status_batch(s.detach().cpu().numpy())
 
         def huber(a, b, delta=huber_delta):
             x = a - b
@@ -359,17 +363,15 @@ class DPMDGraphDisease:
             return torch.where(ax < delta, 0.5*x*x, delta*(ax - 0.5*delta)).mean()
 
         self.q_optim.zero_grad(set_to_none=True)
-        q1_loss = huber(self.q1(z, c_clean), y)
-        q2_loss = huber(self.q2(z, c_clean), y)
+        q1_loss = huber(self.q1(batch_graph, c_clean), y)
+        q2_loss = huber(self.q2(batch_graph, c_clean), y)
         (q1_loss + q2_loss).backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.encoder.parameters()) + list(self.proj.parameters()) +
             list(self.q1.parameters()) + list(self.q2.parameters()),
             10.0
         )
         self.q_optim.step()
 
-        # hard sync targets during pretrain
         with torch.no_grad():
             self.tq1.load_state_dict(self.q1.state_dict())
             self.tq2.load_state_dict(self.q2.state_dict())
@@ -380,47 +382,42 @@ class DPMDGraphDisease:
     # Main update
     # -----------------------------------------------------
     def update(self, batch: Experience) -> Dict[str, float]:
-        z      = _fit_width(_to_tensor(batch.obs,      self.device), self.obs_dim)
-        c_star = _to_tensor(batch.action_star, self.device)
+        s      = _to_tensor(batch.obs,      self.device)              # [B,n]
+        c_star = _to_tensor(batch.action_star, self.device)           # [B,n]
         rew    = _to_tensor(batch.reward,  self.device).view(-1) * float(self.cfg.reward_scale)
-        z_next = _fit_width(_to_tensor(batch.next_obs, self.device), self.obs_dim)
+        s_next = _to_tensor(batch.next_obs, self.device)              # [B,n]
         done   = _to_tensor(batch.done,    self.device).view(-1)
+
+        batch_s = self.batch_from_status_batch(s.detach().cpu().numpy())
+        batch_sn = self.batch_from_status_batch(s_next.detach().cpu().numpy())
 
         # 1) Smoothed target
         with torch.no_grad():
-            Vb = self._smoothed_value(z_next)
+            Vb = self._smoothed_value(batch_sn)  # [B]
             y = rew + (1.0 - done) * float(self.cfg.gamma) * Vb
 
-        # 2) Critic update (encoder is trained here)
+        # 2) Critic update
         def huber(a, b, delta=5.0):
             x = a - b
             ax = torch.abs(x)
             return torch.where(ax < delta, 0.5*x*x, delta*(ax - 0.5*delta)).mean()
 
         self.q_optim.zero_grad(set_to_none=True)
-        q1_loss = huber(self.q1(z, c_star), y)
-        q2_loss = huber(self.q2(z, c_star), y)
+        q1_loss = huber(self.q1(batch_s, c_star), y)
+        q2_loss = huber(self.q2(batch_s, c_star), y)
         (q1_loss + q2_loss).backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(self.encoder.parameters()) + list(self.proj.parameters()) +
-            list(self.q1.parameters()) + list(self.q2.parameters()),
-            10.0
-        )
+        torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
         self.q_optim.step()
 
-        # 3) Actor update: sample c1 from target actor on z, weight with target critics, update diffusion model
+        # 3) Actor update: sample c1 from target actor on s, weight with target critics
         with torch.no_grad():
-            C1 = self._sample_candidates(z, K=1, use_target=True)  # [B,1,D]
-            c1 = C1[:, 0, :]                                       # [B,D]
-            w = self._weights_no_smooth(z, c1, lam=float(self._current_lambda()))
+            C1 = self._sample_candidates(batch_s, K=1, use_target=True)  # [B,1,D]
+            c1 = C1[:, 0, :]                                             # [B,D]
+            w = self._weights_no_smooth(batch_s, c1, lam=float(self._current_lambda()))  # [B]
 
-        policy_loss = rfm_service.update(
-            z.detach().cpu().numpy(),
-            c1.detach().cpu().numpy(),
-            w.detach().cpu().numpy(),
-        )
+        policy_loss = rfm_service_gnn.update(batch_s, c1, w)
 
-        # 4.5) delayed temperature update
+        # 4.5) delayed temperature update (keep your old heuristic)
         if (self.step % max(1, int(self.cfg.delay_alpha_update))) == 0:
             self.alpha_optim.zero_grad(set_to_none=True)
             approx_entropy = 0.5 * self.act_dim * torch.log(
@@ -438,10 +435,11 @@ class DPMDGraphDisease:
                     p_t.mul_(1.0 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
                 for p_t, p in zip(self.tq2.parameters(), self.q2.parameters()):
                     p_t.mul_(1.0 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
-            if hasattr(rfm_service, "soft_update_target"):
-                rfm_service.soft_update_target(self.cfg.tau)
-            elif hasattr(rfm_service, "sync_target_from_current"):
-                rfm_service.sync_target_from_current()
+
+            if hasattr(rfm_service_gnn, "soft_update_target"):
+                rfm_service_gnn.soft_update_target(self.cfg.tau)
+            elif hasattr(rfm_service_gnn, "sync_target_from_current"):
+                rfm_service_gnn.sync_target_from_current()
 
         self.step += 1
 

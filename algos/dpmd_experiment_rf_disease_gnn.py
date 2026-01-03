@@ -7,7 +7,7 @@ import torch
 
 from algos.replay_buffer import ReplayBuffer
 from algos.dpmd_rf_disease_gnn import DPMDGraphDisease, DPMDGraphConfig, Experience
-from models.rfm.service import rfm_service
+from models.rfm.service_gnn import rfm_service_gnn
 
 
 def _reset_obs(env):
@@ -16,7 +16,6 @@ def _reset_obs(env):
 
 
 def _step_unpack(out):
-    # supports (obs, reward, done, info) or (obs, mask, reward, done)
     if isinstance(out, tuple) and len(out) == 4:
         a, b, c, d = out
         if isinstance(b, np.ndarray) and b.shape == np.asarray(a).shape:
@@ -30,12 +29,6 @@ def _step_unpack(out):
 
 
 def build_graph_features_from_env(env) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Builds:
-      node_covariates [n,2] from unary factors
-      edge_index [2,2E] directed
-      edge_attr  [2E,4] directed
-    """
     status, unary_factors, pairwise_factors = env.base.get_status_and_factors()
     n = len(status)
 
@@ -46,13 +39,12 @@ def build_graph_features_from_env(env) -> Tuple[np.ndarray, np.ndarray, np.ndarr
         [min([int(Xidx[1:]) for Xidx in uv]), max([int(Xidx[1:]) for Xidx in uv])]
         for uv in pairwise_factors.keys()
     ]
-    edge_index = np.asarray(edge_list, dtype=np.int64).T  # [2,E]
-    edge_attr = np.asarray([np.asarray(tbl).flatten() for tbl in pairwise_factors.values()], dtype=np.float32)  # [E,4]
+    edge_index = np.asarray(edge_list, dtype=np.int64).T
+    edge_attr = np.asarray([np.asarray(tbl).flatten() for tbl in pairwise_factors.values()], dtype=np.float32)
     assert edge_attr.shape[1] == 4, f"expected edge_attr second dim 4, got {edge_attr.shape}"
 
-    # make directed
-    edge_index_dir = np.concatenate([edge_index, edge_index[[1, 0], :]], axis=1)  # [2,2E]
-    edge_attr_dir = np.concatenate([edge_attr, edge_attr], axis=0)                 # [2E,4]
+    edge_index_dir = np.concatenate([edge_index, edge_index[[1, 0], :]], axis=1)
+    edge_attr_dir = np.concatenate([edge_attr, edge_attr], axis=0)
     return node_cov, edge_index_dir, edge_attr_dir
 
 
@@ -69,17 +61,9 @@ def run_dpmd_rf_disease_gnn(
     batch_size: int,
     train_updates: int,
 ) -> Tuple[np.ndarray, DPMDGraphDisease]:
-    """
-    DPMD-RF loop for disease:
-      - state is encoded by a GNN into z(s)
-      - diffusion actor (rfm_service) samples coefficients c ~ pi(.|z)
-      - twin critics Q(z,c) trained on smoothed Bellman targets
-      - actor updated by MD-weighted rfm_service.update(z, c1, w)
-    """
     np.random.seed(seed)
     torch.manual_seed(seed)
 
-    # Build static graph features
     node_cov, edge_index, edge_attr = build_graph_features_from_env(env)
     n = env.n_arms
 
@@ -91,42 +75,44 @@ def run_dpmd_rf_disease_gnn(
         cfg=cfg,
     )
 
-    # init diffusion policy with obs_dim = embedding dim, act_dim = n
-    rfm_service.init(obs_dim=learner.obs_dim, act_dim=n, lr=1e-4, seed=seed, force=True)
+    # init diffusion policy (GNN actor)
+    rfm_service_gnn.init(
+        node_base_dim=cfg.node_in_dim,   # 3
+        edge_in_dim=cfg.edge_in_dim,     # 4
+        act_dim=n,
+        lr=1e-4,
+        seed=seed,
+        force=True,
+    )
 
-    # Replay stores embeddings, not raw status
-    buffer = ReplayBuffer(capacity=100_000, obs_dim=learner.obs_dim, act_dim=n)
+    # Replay stores status vectors now
+    buffer = ReplayBuffer(capacity=100_000, obs_dim=n, act_dim=n)
 
-    # -------- Warmup collection --------
+    # -------- Warmup --------
     steps_collected = 0
     while steps_collected < warmup_steps:
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)  # [n]
-        z = learner.encode_status(status)                                   # [F]
 
         for _ in range(horizon):
-            # sample candidates using diffusion actor on z
             C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)  # [K,n]
             qs = learner.score_actions(status, C)                                         # [K]
             c_star = C[int(np.argmax(qs))]
 
-            # executed coefficient (vMF noise)
-            c_exec = rfm_service.perturb(c_star.reshape(1, -1), kappa=cfg.kappa_exec, J=1)[0, 0]
+            c_exec = rfm_service_gnn.perturb(c_star.reshape(1, -1), kappa=cfg.kappa_exec, J=1)[0, 0]
 
             action = linear_solver(c_exec)
             status2, rew, done, _ = _step_unpack(env.step(action))
             status2 = np.asarray(status2, dtype=np.float32).reshape(-1)
-            z2 = learner.encode_status(status2)
 
             r_scalar = float(np.sum(rew)) if isinstance(rew, (list, np.ndarray)) else float(rew)
 
             buffer.add(
-                z, c_exec, r_scalar, z2, float(done),
+                status, c_exec, r_scalar, status2, float(done),
                 coeff_star=c_star,
                 policy_id=learner.policy_version
             )
 
             status = status2
-            z = z2
             steps_collected += 1
             if done or steps_collected >= warmup_steps:
                 break
@@ -143,23 +129,21 @@ def run_dpmd_rf_disease_gnn(
     # -------- Training --------
     for _ep in range(int(train_updates)):
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
-        z = learner.encode_status(status)
 
         for _t in range(horizon):
             C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)
             qs = learner.score_actions(status, C)
             c_star = C[int(np.argmax(qs))]
-            c_exec = rfm_service.perturb(c_star.reshape(1, -1), kappa=cfg.kappa_exec, J=1)[0, 0]
+            c_exec = rfm_service_gnn.perturb(c_star.reshape(1, -1), kappa=cfg.kappa_exec, J=1)[0, 0]
 
             action = linear_solver(c_exec)
             status2, rew, done, _ = _step_unpack(env.step(action))
             status2 = np.asarray(status2, dtype=np.float32).reshape(-1)
-            z2 = learner.encode_status(status2)
 
             r_scalar = float(np.sum(rew)) if isinstance(rew, (list, np.ndarray)) else float(rew)
 
             buffer.add(
-                z, c_exec, r_scalar, z2, float(done),
+                status, c_exec, r_scalar, status2, float(done),
                 coeff_star=c_star,
                 policy_id=learner.policy_version
             )
@@ -170,13 +154,12 @@ def run_dpmd_rf_disease_gnn(
                 learner.update(exp)
 
             status = status2
-            z = z2
             if done:
                 break
 
         learner.policy_version += 1
 
-    # -------- Greedy evaluation (no exec noise) --------
+    # -------- Greedy eval (no exec noise) --------
     rewards_all: List[float] = []
     for _ in range(n_episodes_eval):
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
