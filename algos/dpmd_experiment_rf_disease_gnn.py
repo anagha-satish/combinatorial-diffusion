@@ -70,7 +70,7 @@ def run_dpmd_rf_disease_gnn(
     train_updates: int,
 ) -> Tuple[np.ndarray, DPMDGraphDisease]:
     """
-    Paper-faithful DPMD-RF loop for disease:
+    DPMD-RF loop for disease:
       - state is encoded by a GNN into z(s)
       - diffusion actor (rfm_service) samples coefficients c ~ pi(.|z)
       - twin critics Q(z,c) trained on smoothed Bellman targets
