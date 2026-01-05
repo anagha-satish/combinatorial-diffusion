@@ -60,14 +60,11 @@ class TimeEmbed(nn.Module):
 
 # ---------- Helpers for graph batching ----------
 def _repeat_batch(batch: Batch, K: int) -> Batch:
-    """
-    Repeat a Batch of B graphs into a Batch of (B*K) graphs by duplicating Data objects.
-    Assumes topology may be reused; works for fixed topology and variable too.
-    """
+    """Repeat a Batch of B graphs into a Batch of (B*K) graphs."""
     if K <= 1:
         return batch
     data_list = batch.to_data_list()
-    rep = data_list * int(K)
+    rep = [g for g in data_list for _ in range(int(K))]
     return Batch.from_data_list(rep).to(batch.x.device)
 
 
