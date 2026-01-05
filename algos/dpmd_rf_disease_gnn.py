@@ -98,7 +98,7 @@ def _repeat_batch(batch: Batch, K: int) -> Batch:
     if K <= 1:
         return batch
     data_list = batch.to_data_list()
-    rep = data_list * int(K)
+    rep = [g for g in data_list for _ in range(int(K))]
     return Batch.from_data_list(rep).to(batch.x.device)
 
 
