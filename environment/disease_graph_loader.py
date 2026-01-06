@@ -14,7 +14,7 @@ import networkx as nx
 from environment.ICPSR_22140_processor import ICPSR22140Processor
 from environment.log_junction_tree import LogJunctionTree
 from environment.frontier_batch_env import BinaryFrontierEnvBatch
-from utils.io_utils import load_pickle
+from utils.io_utils import load_pickle, save_pickle
 
 
 def pick_random_cc_until_cross_threshold(
@@ -236,5 +236,142 @@ def create_disease_env(
     
     print(f"✓ Environment created: {env.n} nodes, budget={env.budget}")
     print(f"  Frontier roots: {len(env.cc_root)} connected components")
-    
+
     return env
+
+
+def save_graph_cache(
+    G: nx.Graph,
+    covariates: dict,
+    theta_unary: np.ndarray,
+    theta_pairwise: np.ndarray,
+    statuses: dict,
+    std_name: str,
+    inst_idx: int,
+    cc_threshold: int,
+    base_path: Path = None
+) -> str:
+    """
+    Save graph instance to pickle cache file.
+
+    Args:
+        G: NetworkX graph
+        covariates: Node covariate dictionary
+        theta_unary: Fitted unary parameters
+        theta_pairwise: Fitted pairwise parameters
+        statuses: Node infection status dictionary
+        std_name: Disease name
+        inst_idx: Instance index
+        cc_threshold: CC threshold used for generation
+        base_path: Base directory (defaults to parent of this file)
+
+    Returns:
+        str: Path to saved cache file
+    """
+    if base_path is None:
+        base_path = Path(__file__).parent.parent
+
+    # Calculate metadata
+    num_infected = sum(statuses.values())
+    num_nodes = G.number_of_nodes()
+
+    # Build cache file path
+    cache_dir = base_path / "ICPSR_22140" / "graphs" / std_name
+    cache_filename = f"{std_name}_inst{inst_idx}_{num_infected}_{num_nodes}.pkl"
+    cache_path = cache_dir / cache_filename
+
+    # Prepare cache data
+    cache_data = {
+        'G': G,
+        'covariates': covariates,
+        'theta_unary': theta_unary,
+        'theta_pairwise': theta_pairwise,
+        'statuses': statuses,
+        # Metadata for validation
+        'metadata': {
+            'std_name': std_name,
+            'inst_idx': inst_idx,
+            'cc_threshold': cc_threshold,
+            'num_infected': num_infected,
+            'num_nodes': num_nodes,
+        }
+    }
+
+    # Save using existing io_utils (handles directory creation)
+    save_pickle(cache_data, str(cache_path))
+
+    print(f"✓ Saved graph cache to: {cache_path}")
+    return str(cache_path)
+
+
+def load_graph_cache(
+    cache_path: str,
+    expected_std_name: str
+) -> Tuple[nx.Graph, dict, np.ndarray, np.ndarray, dict]:
+    """
+    Load graph instance from pickle cache file.
+
+    Args:
+        cache_path: Path to cached graph pickle file
+        expected_std_name: Expected disease name for validation
+
+    Returns:
+        Tuple of (G, covariates, theta_unary, theta_pairwise, statuses)
+
+    Raises:
+        FileNotFoundError: If cache file doesn't exist
+        ValueError: If std_name doesn't match
+        KeyError: If cache file is corrupt/missing required keys
+    """
+    cache_path = Path(cache_path)
+
+    # Check file exists
+    if not cache_path.exists():
+        raise FileNotFoundError(
+            f"Graph cache file not found: {cache_path}\n"
+            f"Please run without --load_graph_from to generate the cache first."
+        )
+
+    # Load cache data
+    try:
+        cache_data = load_pickle(str(cache_path))
+    except Exception as e:
+        raise RuntimeError(
+            f"Failed to load graph cache from {cache_path}: {e}\n"
+            f"The cache file may be corrupt. Try regenerating it without --load_graph_from."
+        )
+
+    # Validate required keys
+    required_keys = ['G', 'covariates', 'theta_unary', 'theta_pairwise', 'statuses', 'metadata']
+    missing_keys = [k for k in required_keys if k not in cache_data]
+    if missing_keys:
+        raise KeyError(
+            f"Cache file {cache_path} is missing required keys: {missing_keys}\n"
+            f"The cache file may be from an older version. Please regenerate it."
+        )
+
+    # Validate std_name
+    cached_std_name = cache_data['metadata']['std_name']
+    if cached_std_name != expected_std_name:
+        raise ValueError(
+            f"std_name mismatch!\n"
+            f"  Cached graph has std_name: '{cached_std_name}'\n"
+            f"  But you specified: '{expected_std_name}'\n"
+            f"Please use a cache file that matches your --std_name parameter."
+        )
+
+    # Extract components
+    G = cache_data['G']
+    covariates = cache_data['covariates']
+    theta_unary = cache_data['theta_unary']
+    theta_pairwise = cache_data['theta_pairwise']
+    statuses = cache_data['statuses']
+
+    # Log cache metadata
+    meta = cache_data['metadata']
+    print(f"✓ Loaded graph cache from: {cache_path}")
+    print(f"  Metadata: std_name={meta['std_name']}, inst_idx={meta['inst_idx']}, "
+          f"cc_threshold={meta['cc_threshold']}")
+    print(f"  Graph: {meta['num_nodes']} nodes, {meta['num_infected']} infected")
+
+    return G, covariates, theta_unary, theta_pairwise, statuses

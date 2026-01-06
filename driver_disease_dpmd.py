@@ -255,6 +255,9 @@ def main():
     parser.add_argument('--q_norm_clip', type=float, default=3.0)
     parser.add_argument('--q_running_beta', type=float, default=0.05)
 
+    parser.add_argument('--load_graph_from', type=str, default=None,
+                        help='Path to cached graph pickle file. If provided, skips graph generation.')
+
     args = parser.parse_args()
 
     reseed_all(args.seed)
@@ -263,11 +266,36 @@ def main():
     print('Load Disease Graph')
     print('--------------------------------------------------------')
 
-    G, covariates, theta_unary, theta_pairwise, statuses = load_disease_graph_instance(
-        std_name=args.std_name,
-        cc_threshold=args.cc_threshold,
-        inst_idx=args.inst_idx,
-    )
+    if args.load_graph_from is not None:
+        # Load from cache
+        print(f"Loading graph from cache: {args.load_graph_from}")
+        print(f"  Note: Ignoring cc_threshold={args.cc_threshold}, inst_idx={args.inst_idx}")
+
+        from environment.disease_graph_loader import load_graph_cache
+        G, covariates, theta_unary, theta_pairwise, statuses = load_graph_cache(
+            cache_path=args.load_graph_from,
+            expected_std_name=args.std_name
+        )
+    else:
+        # Standard graph generation
+        from environment.disease_graph_loader import save_graph_cache
+        G, covariates, theta_unary, theta_pairwise, statuses = load_disease_graph_instance(
+            std_name=args.std_name,
+            cc_threshold=args.cc_threshold,
+            inst_idx=args.inst_idx,
+        )
+
+        # Save to cache (always overwrite if exists)
+        cache_path = save_graph_cache(
+            G=G,
+            covariates=covariates,
+            theta_unary=theta_unary,
+            theta_pairwise=theta_pairwise,
+            statuses=statuses,
+            std_name=args.std_name,
+            inst_idx=args.inst_idx,
+            cc_threshold=args.cc_threshold
+        )
 
     print('graph stats')
     print(f'  disease: {args.std_name}')
