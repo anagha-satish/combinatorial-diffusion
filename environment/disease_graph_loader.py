@@ -22,31 +22,90 @@ def pick_random_cc_until_cross_threshold(
     G: nx.Graph,
     covariates: dict,
     statuses: dict,
-    threshold: int
+    threshold: int,
+    max_overshoot_pct: float = 0.1,
+    min_infection_rate: float = 0.2,
+    max_attempts: int = 100
 ) -> Tuple[nx.Graph, dict, dict]:
     """
     Sample connected components from graph until total nodes >= threshold.
+
+    Args:
+        inst_idx: Random seed for reproducible sampling
+        G: NetworkX graph
+        covariates: Node covariate dictionary
+        statuses: Node infection status dictionary
+        threshold: Minimum number of nodes to sample
+        max_overshoot_pct: Maximum allowed overshoot as fraction of threshold (default 0.1 = 10%)
+        min_infection_rate: Minimum required fraction of infected nodes (default 0.2 = 20%)
+        max_attempts: Maximum retry attempts before falling back (default 100)
+
+    Returns:
+        Tuple of (subgraph, subgraph_covariates, subgraph_statuses)
     """
-    rng = np.random.default_rng(inst_idx)
-    subgraph_nodes = set()
-    subgraph_covariates = dict()
-    subgraph_statuses = dict()
-    idx_mapping = dict()
-    
     all_cc_nodes = np.array(list(nx.connected_components(G)))
-    rng.shuffle(all_cc_nodes)
-    
-    for cc_nodes in all_cc_nodes:
-        subgraph_nodes.update(cc_nodes)
-        for i in cc_nodes:
-            idx_mapping[i] = len(idx_mapping)
-            subgraph_covariates[idx_mapping[i]] = covariates[i]
-            subgraph_statuses[idx_mapping[i]] = statuses[i]
-        if len(subgraph_nodes) >= threshold:
-            break
-    
-    H = G.subgraph(subgraph_nodes)
-    H = nx.relabel_nodes(H, idx_mapping)
+    best_attempt = None
+    best_score = -float('inf')  # Track best attempt for fallback
+
+    if len(all_cc_nodes) == 0:
+        # Empty graph edge case
+        return G, {}, {}
+
+    for attempt in range(max_attempts):
+        rng = np.random.default_rng(inst_idx + attempt)
+        subgraph_nodes = set()
+        subgraph_covariates = dict()
+        subgraph_statuses = dict()
+        idx_mapping = dict()
+
+        # Shuffle CCs with different seed each attempt
+        cc_order = all_cc_nodes.copy()
+        rng.shuffle(cc_order)
+
+        # Accumulate CCs until threshold crossed
+        for cc_nodes in cc_order:
+            subgraph_nodes.update(cc_nodes)
+            for i in cc_nodes:
+                idx_mapping[i] = len(idx_mapping)
+                subgraph_covariates[idx_mapping[i]] = covariates[i]
+                subgraph_statuses[idx_mapping[i]] = statuses[i]
+
+            if len(subgraph_nodes) >= threshold:
+                break
+
+        # Build subgraph
+        H = G.subgraph(subgraph_nodes)
+        H = nx.relabel_nodes(H, idx_mapping)
+
+        # Check constraints
+        size = len(subgraph_nodes)
+        total_infected = sum(subgraph_statuses.values())
+        inf_rate = total_infected / size if size > 0 else 0.0
+
+        max_size = threshold * (1 + max_overshoot_pct)
+        size_ok = size <= max_size
+        inf_ok = inf_rate >= min_infection_rate
+
+        # Track best attempt (score = weighted combination of constraints)
+        # Prioritize infection rate, then size constraint
+        score = inf_rate - (max(0, size - max_size) / threshold) * 0.5
+        if score > best_score:
+            best_score = score
+            best_attempt = (H, subgraph_covariates, subgraph_statuses, size, inf_rate)
+
+        # Return if both constraints satisfied
+        if size_ok and inf_ok:
+            return H, subgraph_covariates, subgraph_statuses
+
+    # Fallback: return best attempt with warning
+    if best_attempt is None:
+        raise RuntimeError(f"Failed to generate any valid subgraph after {max_attempts} attempts")
+
+    H, subgraph_covariates, subgraph_statuses, size, inf_rate = best_attempt
+    print(f"Warning: Could not meet all constraints after {max_attempts} attempts")
+    print(f"  Threshold: {threshold}, Max size: {threshold * (1 + max_overshoot_pct):.0f}")
+    print(f"  Best attempt: size={size} ({size/threshold:.1%} of threshold), infection_rate={inf_rate:.1%}")
+    print(f"  Required: size <= {threshold * (1 + max_overshoot_pct):.0f}, infection_rate >= {min_infection_rate:.1%}")
     return H, subgraph_covariates, subgraph_statuses
 
 
