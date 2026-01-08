@@ -21,6 +21,7 @@ from algos.dpmd_rf_disease_gnn import DPMDGraphConfig
 # Simple wrapper around BinaryFrontierEnvBatch
 # ------------------------------------------------------------------
 
+
 class DiseaseDPMDEnv:
     """
     Wrap BinaryFrontierEnvBatch so it looks like the env expected
@@ -32,8 +33,8 @@ class DiseaseDPMDEnv:
         self.base = base_env
 
         # Attributes expected by run_dpmd_only / approximator
-        self.n_arms = base_env.num_nodes        # action dimension
-        self.n_actions = 1                      # dummy
+        self.n_arms = base_env.num_nodes  # action dimension
+        self.n_actions = 1  # dummy
         self.budget = base_env.budget
         self.discount_factor = base_env.discount_factor
         self.num_nodes = base_env.num_nodes
@@ -77,10 +78,12 @@ class DiseaseDPMDEnv:
 # Reseed util
 # ------------------------------------------------------------------
 
+
 def reseed_all(seed: int) -> None:
     import random
+
     random.seed(seed)
-    np_seed = seed % (2 ** 32 - 1)
+    np_seed = seed % (2**32 - 1)
     np.random.seed(np_seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
@@ -90,6 +93,7 @@ def reseed_all(seed: int) -> None:
 # ------------------------------------------------------------------
 # Detection curve evaluation
 # ------------------------------------------------------------------
+
 
 def evaluate_detection_curve(
     learner,
@@ -115,7 +119,7 @@ def evaluate_detection_curve(
     # Enough steps to (in principle) test everyone once
     max_steps = int(np.ceil(n / B)) + 1
 
-    all_tested = []    # [E, T]
+    all_tested = []  # [E, T]
     all_detected = []  # [E, T]
 
     for ep in range(n_episodes_eval):
@@ -196,8 +200,8 @@ def evaluate_detection_curve(
         all_tested.append(tested_frac)
         all_detected.append(detected_frac)
 
-    all_tested = np.array(all_tested)     # [E, T]
-    all_detected = np.array(all_detected) # [E, T]
+    all_tested = np.array(all_tested)  # [E, T]
+    all_detected = np.array(all_detected)  # [E, T]
 
     x = all_tested.mean(axis=0)
     y = all_detected.mean(axis=0)
@@ -210,79 +214,110 @@ def evaluate_detection_curve(
 # Main
 # ------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="DPMD-RF on disease graphs")
 
-    parser.add_argument('-D', '--std_name', type=str, default='HIV',
-                        help='{HIV, Gonorrhea, Chlamydia, Syphilis, Hepatitis}')
-    parser.add_argument('-T', '--cc_threshold', type=int, default=300,
-                        help='minimum nodes from connected components')
-    parser.add_argument('-I', '--inst_idx', type=int, default=0,
-                        help='instance index controlling CC sampling')
-    parser.add_argument('-B', '--budget', type=int, default=5,
-                        help='batch size per step')
-    parser.add_argument('-V', '--n_episodes_eval', type=int, default=10,
-                        help='episodes to evaluate after training')
-    parser.add_argument('-s', '--seed', type=int, default=0)
+    parser.add_argument(
+        "-D",
+        "--std_name",
+        type=str,
+        default="HIV",
+        help="{HIV, Gonorrhea, Chlamydia, Syphilis, Hepatitis}",
+    )
+    parser.add_argument(
+        "-T",
+        "--cc_threshold",
+        type=int,
+        default=300,
+        help="minimum nodes from connected components",
+    )
+    parser.add_argument(
+        "-I",
+        "--inst_idx",
+        type=int,
+        default=0,
+        help="instance index controlling CC sampling",
+    )
+    parser.add_argument(
+        "-B", "--budget", type=int, default=5, help="batch size per step"
+    )
+    parser.add_argument(
+        "-V",
+        "--n_episodes_eval",
+        type=int,
+        default=10,
+        help="episodes to evaluate after training",
+    )
+    parser.add_argument("-s", "--seed", type=int, default=0)
 
     # Training budgets
-    parser.add_argument('--warmup_steps', type=int, default=1000)
-    parser.add_argument('--train_updates', type=int, default=2000)
-    parser.add_argument('--batch_size', type=int, default=64)
+    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--train_updates", type=int, default=2000)
+    parser.add_argument("--batch_size", type=int, default=64)
 
     # Core RL hyperparams
-    parser.add_argument('--gamma', type=float, default=0.99)
-    parser.add_argument('--tau', type=float, default=0.005)
-    parser.add_argument('--delay_update', type=int, default=2)
-    parser.add_argument('--reward_scale', type=float, default=1.0)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--tau", type=float, default=0.005)
+    parser.add_argument("--delay_update", type=int, default=2)
+    parser.add_argument("--reward_scale", type=float, default=1.0)
 
     # DPMD / RFM hyperparams
-    parser.add_argument('--lr', type=float, default=4e-4)
-    parser.add_argument('--num_particles', type=int, default=12)
+    parser.add_argument("--lr", type=float, default=4e-4)
+    parser.add_argument("--num_particles", type=int, default=12)
 
-    parser.add_argument('--lambda_start', type=float, default=2.0)
-    parser.add_argument('--lambda_end', type=float, default=0.8)
-    parser.add_argument('--lambda_steps', type=int, default=10000)
-    parser.add_argument('--w_clip', type=float, default=4.0)
+    parser.add_argument("--lambda_start", type=float, default=2.0)
+    parser.add_argument("--lambda_end", type=float, default=0.8)
+    parser.add_argument("--lambda_steps", type=int, default=10000)
+    parser.add_argument("--w_clip", type=float, default=4.0)
 
-    parser.add_argument('--kappa_exec', type=float, default=28.0)
-    parser.add_argument('--kappa_smooth', type=float, default=28.0)
-    parser.add_argument('--M_smooth', type=int, default=16)
-    parser.add_argument('--J_smooth', type=int, default=1)
+    parser.add_argument("--kappa_exec", type=float, default=28.0)
+    parser.add_argument("--kappa_smooth", type=float, default=28.0)
+    parser.add_argument("--M_smooth", type=int, default=16)
+    parser.add_argument("--J_smooth", type=int, default=1)
 
-    parser.add_argument('--flow_steps', type=int, default=36)
+    parser.add_argument("--flow_steps", type=int, default=36)
 
-    parser.add_argument('--q_norm_clip', type=float, default=3.0)
-    parser.add_argument('--q_running_beta', type=float, default=0.05)
+    parser.add_argument("--q_norm_clip", type=float, default=3.0)
+    parser.add_argument("--q_running_beta", type=float, default=0.05)
 
-    parser.add_argument('--load_graph_from', type=str, default=None,
-                        help='Path to cached graph pickle file. If provided, skips graph generation.')
+    parser.add_argument(
+        "--load_graph_from",
+        type=str,
+        default=None,
+        help="Path to cached graph pickle file. If provided, skips graph generation.",
+    )
 
     args = parser.parse_args()
 
     reseed_all(args.seed)
 
-    print('--------------------------------------------------------')
-    print('Load Disease Graph')
-    print('--------------------------------------------------------')
+    print("--------------------------------------------------------")
+    print("Load Disease Graph")
+    print("--------------------------------------------------------")
 
     if args.load_graph_from is not None:
         # Load from cache
         print(f"Loading graph from cache: {args.load_graph_from}")
-        print(f"  Note: Ignoring cc_threshold={args.cc_threshold}, inst_idx={args.inst_idx}")
+        print(
+            f"  Note: Ignoring cc_threshold={args.cc_threshold}, inst_idx={args.inst_idx}"
+        )
 
         from environment.disease_graph_loader import load_graph_cache
+
         G, covariates, theta_unary, theta_pairwise, statuses = load_graph_cache(
-            cache_path=args.load_graph_from,
-            expected_std_name=args.std_name
+            cache_path=args.load_graph_from, expected_std_name=args.std_name
         )
     else:
         # Standard graph generation
         from environment.disease_graph_loader import save_graph_cache
-        G, covariates, theta_unary, theta_pairwise, statuses = load_disease_graph_instance(
-            std_name=args.std_name,
-            cc_threshold=args.cc_threshold,
-            inst_idx=args.inst_idx,
+
+        G, covariates, theta_unary, theta_pairwise, statuses = (
+            load_disease_graph_instance(
+                std_name=args.std_name,
+                cc_threshold=args.cc_threshold,
+                inst_idx=args.inst_idx,
+            )
         )
 
         # Save to cache (always overwrite if exists)
@@ -294,22 +329,27 @@ def main():
             statuses=statuses,
             std_name=args.std_name,
             inst_idx=args.inst_idx,
-            cc_threshold=args.cc_threshold
+            cc_threshold=args.cc_threshold,
         )
 
-    print('graph stats')
-    print(f'  disease: {args.std_name}')
-    print(f'  nodes: {G.number_of_nodes()}, edges: {G.number_of_edges()}')
-    print(f'  infected: {sum(statuses.values())}/{len(statuses)} '
-          f'({100*sum(statuses.values())/len(statuses):.1f}%)')
-    print(f'  covariate dim: {len(covariates[0])}')
+    print("graph stats")
+    print(f"  disease: {args.std_name}")
+    print(f"  nodes: {G.number_of_nodes()}, edges: {G.number_of_edges()}")
+    print(
+        f"  infected: {sum(statuses.values())}/{len(statuses)} "
+        f"({100*sum(statuses.values())/len(statuses):.1f}%)"
+    )
+    print(f"  covariate dim: {len(covariates[0])}")
 
-    print('--------------------------------------------------------')
-    print('Create Disease Environment')
-    print('--------------------------------------------------------')
+    print("--------------------------------------------------------")
+    print("Create Disease Environment")
+    print("--------------------------------------------------------")
 
     base_env = create_disease_env(
-        G, covariates, theta_unary, theta_pairwise,
+        G,
+        covariates,
+        theta_unary,
+        theta_pairwise,
         budget=args.budget,
         discount_factor=args.gamma,
         rng_seed=args.seed,
@@ -317,7 +357,7 @@ def main():
 
     env = DiseaseDPMDEnv(base_env)
     horizon = base_env.n
-    print(f'environment: n={base_env.n}, budget={base_env.budget}')
+    print(f"environment: n={base_env.n}, budget={base_env.budget}")
 
     # Build linear solver for DPMD using BatchGraphApproximator
     approximator = BatchGraphApproximator(env)
@@ -343,11 +383,12 @@ def main():
         lambda_steps=args.lambda_steps,
         q_norm_clip=args.q_norm_clip,
         q_running_beta=args.q_running_beta,
+        flow_steps=args.flow_steps,
     )
 
-    print('--------------------------------------------------------')
-    print('Train + Evaluate DPMD-RF on disease env')
-    print('--------------------------------------------------------')
+    print("--------------------------------------------------------")
+    print("Train + Evaluate DPMD-RF on disease env")
+    print("--------------------------------------------------------")
 
     t0 = time.time()
     # IMPORTANT: run_dpmd_only must return (rewards_array, learner)
@@ -396,12 +437,7 @@ def main():
     # Save evaluation vectors (unique per sweep run)
     # ------------------------------------------------------------------
     npz_path = f"results/eval_results_{run_tag}.npz"
-    np.savez(
-        npz_path,
-        x=x,
-        y=y,
-        y_std=y_std
-    )
+    np.savez(npz_path, x=x, y=y, y_std=y_std)
     print("Saved eval vectors to:", npz_path)
 
     # ------------------------------------------------------------------
@@ -424,8 +460,6 @@ def main():
     print("Saved plot to:", png_path)
     plt.close()
 
-
-
     # Discounted return summary (using training-time rewards)
     gamma = args.gamma
     rewards = np.asarray(rewards, dtype=float)
@@ -444,13 +478,17 @@ def main():
         mean_disc = 0.0
         std_disc = 0.0
 
-    print('--------------------------------------------------------')
-    print('Results')
-    print('--------------------------------------------------------')
-    print(f'{args.std_name} disease testing | n={base_env.n}, budget={args.budget}, gamma={gamma}')
-    print(f'  episodes: {disc_returns.size}, mean discounted return = {mean_disc:.4f}, std = {std_disc:.4f}')
-    print(f'  runtime: {elapsed:.2f} seconds')
-    print('[done]')
+    print("--------------------------------------------------------")
+    print("Results")
+    print("--------------------------------------------------------")
+    print(
+        f"{args.std_name} disease testing | n={base_env.n}, budget={args.budget}, gamma={gamma}"
+    )
+    print(
+        f"  episodes: {disc_returns.size}, mean discounted return = {mean_disc:.4f}, std = {std_disc:.4f}"
+    )
+    print(f"  runtime: {elapsed:.2f} seconds")
+    print("[done]")
 
 
 if __name__ == "__main__":

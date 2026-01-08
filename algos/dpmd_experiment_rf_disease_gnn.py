@@ -108,7 +108,7 @@ def run_dpmd_rf_disease_gnn(
 
         for _ in range(horizon):
             C = learner.sample_candidates(
-                status, K=cfg.num_particles, use_target=False
+                status, K=cfg.num_particles
             )  # [K,n]
             qs = learner.score_actions(status, C)  # [K]
             c_star = C[int(np.argmax(qs))]
@@ -162,7 +162,7 @@ def run_dpmd_rf_disease_gnn(
         ep_reward = 0.0
 
         for _t in range(horizon):
-            C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)
+            C = learner.sample_candidates(status, K=cfg.num_particles)
             qs = learner.score_actions(status, C)
             c_star = C[int(np.argmax(qs))]
             c_exec = rfm_service_gnn.perturb(
@@ -235,7 +235,7 @@ def run_dpmd_rf_disease_gnn(
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
 
         for t in range(horizon):
-            C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)
+            C = learner.sample_candidates(status, K=cfg.num_particles)
             qs = learner.score_actions(status, C)
             c_star = C[int(np.argmax(qs))]
 
