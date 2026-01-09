@@ -4,6 +4,7 @@ import argparse
 import time
 
 import numpy as np
+import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import os
@@ -14,7 +15,7 @@ from environment.disease_graph_loader import (
 )
 from approximator.batch_graph_approximator import BatchGraphApproximator
 
-from algos.dpmd_experiment_rf_disease_gnn import run_dpmd_rf_disease_gnn
+from algos.dpmd_experiment_rf_disease_gnn import run_dpmd_rf_disease_gnn, evaluate_detection_curve
 from algos.dpmd_rf_disease_gnn import DPMDGraphConfig
 
 # ------------------------------------------------------------------
@@ -88,126 +89,6 @@ def reseed_all(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-# ------------------------------------------------------------------
-# Detection curve evaluation
-# ------------------------------------------------------------------
-
-
-def evaluate_detection_curve(
-    learner,
-    env,
-    linear_solver,
-    n_episodes_eval: int = 10,
-):
-    """
-    Evaluate a trained DPMD policy on the disease environment.
-
-    Returns:
-        x: [T] mean fraction of population tested
-        y: [T] mean fraction of positive cases detected (normalized)
-        y_std: [T] std of fraction detected across episodes
-    """
-    # Number of nodes in the graph
-    n = getattr(env, "num_nodes", getattr(env, "n", None))
-    if n is None:
-        raise AttributeError("Env must have attribute `num_nodes` or `n`.")
-
-    # Per-step testing budget
-    B = int(getattr(env, "budget", 1))
-    # Enough steps to (in principle) test everyone once
-    max_steps = int(np.ceil(n / B)) + 1
-
-    all_tested = []  # [E, T]
-    all_detected = []  # [E, T]
-
-    for ep in range(n_episodes_eval):
-        reset_out = env.reset()
-        if isinstance(reset_out, tuple):
-            obs = reset_out[0]
-        else:
-            obs = reset_out
-        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
-
-        cum_rewards = []
-        tested_frac = []
-        cum = 0.0
-
-        for step in range(max_steps):
-            # Greedy action from trained policy (same pattern as in run_dpmd_only)
-            Cs = learner.sample_candidates(obs, K=learner.cfg.num_particles)
-            qs = learner.score_actions(obs, Cs)
-            j = int(np.argmax(qs))
-            c_star = Cs[j]
-            action = linear_solver(c_star)
-
-            step_out = env.step(action)
-
-            # Try to interpret env.step() output robustly
-            if isinstance(step_out, tuple) and len(step_out) == 4:
-                a, b, c, d = step_out
-                # Heuristic: if 'b' looks like a mask with same shape as 'a',
-                # treat as (obs, mask, reward, done); else (obs, reward, done, info)
-                if isinstance(b, np.ndarray) and b.shape == np.asarray(a).shape:
-                    next_obs = a
-                    reward = c
-                    done = d
-                else:
-                    next_obs = a
-                    reward = b
-                    done = c
-            elif isinstance(step_out, tuple) and len(step_out) == 5:
-                # Gymnasium-style: (obs, reward, terminated, truncated, info)
-                next_obs, reward, terminated, truncated, _info = step_out
-                done = bool(terminated or truncated)
-            else:
-                # Fallback
-                try:
-                    next_obs, reward, done = step_out[0], step_out[1], step_out[2]
-                except Exception:
-                    break
-
-            cum += float(reward)
-            obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
-
-            # Use env.tests_done if exposed; otherwise infer from obs
-            if hasattr(env, "tests_done"):
-                tests_done = float(env.tests_done)
-            else:
-                status = obs
-                tests_done = float(np.count_nonzero(status > -0.5))
-
-            tested_frac.append(tests_done / float(n))
-            cum_rewards.append(cum)
-
-            if done:
-                break
-
-        if len(cum_rewards) == 0:
-            cum_rewards = [0.0]
-            tested_frac = [0.0]
-
-        # Total positives in this world = final cumulative reward
-        total_pos = max(cum_rewards[-1], 1.0)
-        detected_frac = [cr / total_pos for cr in cum_rewards]
-
-        # Pad to max_steps so we can average across episodes
-        while len(tested_frac) < max_steps:
-            tested_frac.append(tested_frac[-1])
-            detected_frac.append(detected_frac[-1])
-
-        all_tested.append(tested_frac)
-        all_detected.append(detected_frac)
-
-    all_tested = np.array(all_tested)  # [E, T]
-    all_detected = np.array(all_detected)  # [E, T]
-
-    x = all_tested.mean(axis=0)
-    y = all_detected.mean(axis=0)
-    y_std = all_detected.std(axis=0)
-
-    return x, y, y_std
 
 
 # ------------------------------------------------------------------
@@ -286,6 +167,19 @@ def main():
         type=str,
         default=None,
         help="Path to cached graph pickle file. If provided, skips graph generation.",
+    )
+
+    parser.add_argument(
+        "--use_critic_only_eval",
+        action="store_true",
+        help="Bypass actor during evaluation; use critic Q-values directly (for budget=1 debugging)",
+    )
+
+    parser.add_argument(
+        "--results_dir",
+        type=str,
+        default="results",
+        help="Directory for saving plots and evaluation results",
     )
 
     args = parser.parse_args()
@@ -384,6 +278,7 @@ def main():
         q_norm_clip=args.q_norm_clip,
         q_running_beta=args.q_running_beta,
         flow_steps=args.flow_steps,
+        use_critic_only_eval=args.use_critic_only_eval,
     )
 
     print("--------------------------------------------------------")
@@ -403,21 +298,14 @@ def main():
         warmup_steps=args.warmup_steps,
         batch_size=args.batch_size,
         train_updates=args.train_updates,
+        results_dir=args.results_dir,
     )
     elapsed = time.time() - t0
-
-    # Detection curve for the trained policy
-    x, y, y_std = evaluate_detection_curve(
-        learner,
-        env,
-        linear_solver,
-        n_episodes_eval=10,
-    )
 
     # ------------------------------------------------------------------
     # Ensure results directory exists
     # ------------------------------------------------------------------
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(args.results_dir, exist_ok=True)
 
     # ------------------------------------------------------------------
     # Unique run tag for sweeps (already correct)
@@ -433,32 +321,102 @@ def main():
         f"_K{args.num_particles}"
     )
 
-    # ------------------------------------------------------------------
-    # Save evaluation vectors (unique per sweep run)
-    # ------------------------------------------------------------------
-    npz_path = f"results/eval_results_{run_tag}.npz"
-    np.savez(npz_path, x=x, y=y, y_std=y_std)
-    print("Saved eval vectors to:", npz_path)
+    # Detection curve for the trained policy
+    if args.use_critic_only_eval:
+        # Dual evaluation mode: run both actor and critic
+        # Actor eval (use_critic_override=False)
+        x_actor, y_actor, y_std_actor, traj_rows = evaluate_detection_curve(
+            learner,
+            env,
+            linear_solver,
+            n_episodes_eval=10,
+            gamma=args.gamma,
+            use_critic_override=False,
+        )
 
-    # ------------------------------------------------------------------
-    # Plot detection curve (unique per sweep run)
-    # ------------------------------------------------------------------
-    plt.figure(figsize=(8, 4))
-    plt.plot(x, y, linestyle="--", color="tab:blue", label="DPMD-RF")
-    plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
-    plt.axvline(x=0.5, linestyle="--", color="gray", alpha=0.7)
-    plt.xlabel("Fraction of population tested")
-    plt.ylabel("Fraction of positive cases detected (normalized)")
-    plt.title("Policies with discount = 0.99")
-    plt.xlim(0.0, 1.0)
-    plt.ylim(0.0, 1.05)
-    plt.legend()
-    plt.tight_layout()
+        # Save actor results
+        npz_path = f"{args.results_dir}/eval_results_{run_tag}.npz"
+        np.savez(npz_path, x=x_actor, y=y_actor, y_std=y_std_actor)
+        print("Saved eval vectors (actor) to:", npz_path)
 
-    png_path = f"results/disease_detection_curve_{run_tag}.png"
-    plt.savefig(png_path, dpi=200)
-    print("Saved plot to:", png_path)
-    plt.close()
+        traj_path = f"{args.results_dir}/trajectories_{run_tag}.csv"
+        pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+        print("Saved trajectories (actor) to:", traj_path)
+
+        # Critic eval (use_critic_override=True)
+        x_critic, y_critic, y_std_critic, _ = evaluate_detection_curve(
+            learner,
+            env,
+            linear_solver,
+            n_episodes_eval=10,
+            gamma=args.gamma,
+            use_critic_override=True,
+        )
+
+        # Combined plot with both actor and critic
+        plt.figure(figsize=(10, 6))
+        plt.plot(x_actor, y_actor, linestyle="-", color="tab:blue", linewidth=2, label="Actor")
+        plt.fill_between(x_actor, y_actor - y_std_actor, y_actor + y_std_actor, color="tab:blue", alpha=0.25)
+        plt.plot(x_critic, y_critic, linestyle="--", color="tab:orange", linewidth=2, label="Critic")
+        plt.fill_between(x_critic, y_critic - y_std_critic, y_critic + y_std_critic, color="tab:orange", alpha=0.25)
+        plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
+        plt.xlabel("Fraction of population tested")
+        plt.ylabel("Fraction of positive cases detected (normalized)")
+        plt.title(f"Detection Curve Comparison (gamma={args.gamma})")
+        plt.xlim(0.0, 1.0)
+        plt.ylim(0.0, 1.05)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+
+        png_path = f"{args.results_dir}/disease_detection_curve_{run_tag}.png"
+        plt.savefig(png_path, dpi=200)
+        print("Saved combined plot to:", png_path)
+        plt.close()
+
+    else:
+        # Normal evaluation mode: run only actor eval
+        x, y, y_std, traj_rows = evaluate_detection_curve(
+            learner,
+            env,
+            linear_solver,
+            n_episodes_eval=10,
+            gamma=args.gamma,
+        )
+
+        # ------------------------------------------------------------------
+        # Save evaluation vectors (unique per sweep run)
+        # ------------------------------------------------------------------
+        npz_path = f"{args.results_dir}/eval_results_{run_tag}.npz"
+        np.savez(npz_path, x=x, y=y, y_std=y_std)
+        print("Saved eval vectors to:", npz_path)
+
+        # ------------------------------------------------------------------
+        # Save trajectories CSV (for overlay with random baseline)
+        # ------------------------------------------------------------------
+        traj_path = f"{args.results_dir}/trajectories_{run_tag}.csv"
+        pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+        print("Saved trajectories to:", traj_path)
+
+        # ------------------------------------------------------------------
+        # Plot detection curve (unique per sweep run)
+        # ------------------------------------------------------------------
+        plt.figure(figsize=(8, 4))
+        plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
+        plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
+        plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
+        plt.xlabel("Fraction of population tested")
+        plt.ylabel("Fraction of positive cases detected (normalized)")
+        plt.title(f"Policies with discount = {args.gamma}")
+        plt.xlim(0.0, 1.0)
+        plt.ylim(0.0, 1.05)
+        plt.legend()
+        plt.tight_layout()
+
+        png_path = f"{args.results_dir}/disease_detection_curve_{run_tag}.png"
+        plt.savefig(png_path, dpi=200)
+        print("Saved plot to:", png_path)
+        plt.close()
 
     # Discounted return summary (using training-time rewards)
     gamma = args.gamma

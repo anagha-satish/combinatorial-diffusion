@@ -1,9 +1,13 @@
 # algos/dpmd_experiment_rf_disease_gnn.py
 from __future__ import annotations
 
+import os
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Tuple, Optional
+
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 
 from algos.replay_buffer import ReplayBuffer
@@ -60,6 +64,151 @@ def build_graph_features_from_env(env) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     return node_cov, edge_index_dir, edge_attr_dir
 
 
+def evaluate_detection_curve(
+    learner,
+    env,
+    linear_solver,
+    n_episodes_eval: int = 25,
+    gamma: float = 0.99,
+    use_critic_override: Optional[bool] = None,
+):
+    """
+    Evaluate a trained DPMD policy on the disease environment.
+
+    Args:
+        use_critic_override: If not None, explicitly controls whether to use critic-only eval.
+                           If None, uses learner.cfg.use_critic_only_eval value.
+
+    Returns:
+        x: [T] mean fraction of population tested
+        y: [T] mean fraction of positive cases detected (normalized)
+        y_std: [T] std of fraction detected across episodes
+        traj_rows: list of dicts for CSV export (matching random driver format)
+    """
+    n = getattr(env, "num_nodes", getattr(env, "n", None))
+    if n is None:
+        raise AttributeError("Env must have attribute `num_nodes` or `n`.")
+
+    B = int(getattr(env, "budget", 1))
+    max_steps = int(np.ceil(n / B)) + 1
+
+    all_tested = []
+    all_detected = []
+    traj_rows = []
+
+    for ep in range(n_episodes_eval):
+        reset_out = env.reset()
+        if isinstance(reset_out, tuple):
+            obs = reset_out[0]
+        else:
+            obs = reset_out
+        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+
+        step_rewards = []
+        cum_tests_list = []
+        cum_pos_list = []
+        tested_frac = []
+        cum_pos = 0.0
+
+        for step in range(max_steps):
+            # Use override if provided, otherwise use config value
+            use_critic = use_critic_override if use_critic_override is not None else learner.cfg.use_critic_only_eval
+
+            if use_critic:
+                node_q_values = learner.get_node_q_values(obs)
+                action = linear_solver(node_q_values)
+            else:
+                Cs = learner.sample_candidates(obs, K=learner.cfg.num_particles)
+                qs = learner.score_actions(obs, Cs)
+                j = int(np.argmax(qs))
+                c_star = Cs[j]
+                action = linear_solver(c_star)
+
+            step_out = env.step(action)
+
+            if isinstance(step_out, tuple) and len(step_out) == 4:
+                a, b, c, d = step_out
+                if isinstance(b, np.ndarray) and b.shape == np.asarray(a).shape:
+                    next_obs = a
+                    reward = c
+                    done = d
+                else:
+                    next_obs = a
+                    reward = b
+                    done = c
+            elif isinstance(step_out, tuple) and len(step_out) == 5:
+                next_obs, reward, terminated, truncated, _info = step_out
+                done = bool(terminated or truncated)
+            else:
+                try:
+                    next_obs, reward, done = step_out[0], step_out[1], step_out[2]
+                except Exception:
+                    break
+
+            r_scalar = float(reward)
+            cum_pos += r_scalar
+            obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+
+            if hasattr(env, "tests_done"):
+                tests_done = float(env.tests_done)
+            else:
+                status = obs
+                tests_done = float(np.count_nonzero(status > -0.5))
+
+            step_rewards.append(r_scalar)
+            cum_tests_list.append(tests_done)
+            cum_pos_list.append(cum_pos)
+            tested_frac.append(tests_done / float(n))
+
+            if done:
+                break
+
+        if len(step_rewards) == 0:
+            step_rewards = [0.0]
+            cum_tests_list = [0.0]
+            cum_pos_list = [0.0]
+            tested_frac = [0.0]
+
+        total_pos = max(cum_pos_list[-1], 1.0)
+        detected_frac = [cp / total_pos for cp in cum_pos_list]
+
+        # Compute discounted cumulative reward
+        discounts = gamma ** np.arange(len(step_rewards))
+        disc_cum = np.cumsum(np.array(step_rewards) * discounts)
+
+        # Build trajectory rows for this episode
+        for t in range(len(step_rewards)):
+            traj_rows.append(
+                {
+                    "episode": ep,
+                    "step": t,
+                    "reward": step_rewards[t],
+                    "discounted_cum_reward": disc_cum[t],
+                    "cum_tests": cum_tests_list[t],
+                    "cum_positives": cum_pos_list[t],
+                    "frac_tested": tested_frac[t],
+                    "frac_detected": detected_frac[t],
+                }
+            )
+
+        # Pad to max_steps for averaging
+        while len(tested_frac) < max_steps:
+            tested_frac.append(tested_frac[-1])
+            detected_frac.append(detected_frac[-1])
+
+        all_tested.append(tested_frac)
+        all_detected.append(detected_frac)
+
+    all_tested = np.array(all_tested)
+    all_detected = np.array(all_detected)
+
+    x = all_tested.mean(axis=0)
+    y = all_detected.mean(axis=0)
+    y_std = all_detected.std(axis=0)
+
+    return x, y, y_std, traj_rows
+
+
 def run_dpmd_rf_disease_gnn(
     env,
     horizon: int,
@@ -73,6 +222,7 @@ def run_dpmd_rf_disease_gnn(
     batch_size: int,
     train_updates: int,
     log_every_n_episodes: int = 10,
+    results_dir: str = "results",
 ) -> Tuple[np.ndarray, DPMDGraphDisease]:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -107,9 +257,7 @@ def run_dpmd_rf_disease_gnn(
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)  # [n]
 
         for _ in range(horizon):
-            C = learner.sample_candidates(
-                status, K=cfg.num_particles
-            )  # [K,n]
+            C = learner.sample_candidates(status, K=cfg.num_particles)  # [K,n]
             qs = learner.score_actions(status, C)  # [K]
             c_star = C[int(np.argmax(qs))]
 
@@ -212,6 +360,9 @@ def run_dpmd_rf_disease_gnn(
         learner.policy_version += 1
 
         if (_ep + 1) % log_every_n_episodes == 0:
+            # Ensure results directory exists
+            os.makedirs(results_dir, exist_ok=True)
+
             avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0.0
             avg_q = np.mean(recent_q_values[-50:]) if recent_q_values else 0.0
             loss_strs = " | ".join(
@@ -224,6 +375,110 @@ def run_dpmd_rf_disease_gnn(
                 + (f" | {loss_strs}" if loss_strs else "")
             )
 
+            # # Periodic evaluation with discounted rewards (3 episodes) - COMMENTED OUT PER USER REQUEST
+            # eval_disc_returns = []
+            # for _ in range(3):
+            #     eval_status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
+            #     ep_step_rewards = []
+            #     for _ in range(horizon):
+            #         if cfg.use_critic_only_eval:
+            #             node_q_values = learner.get_node_q_values(eval_status)
+            #             eval_action = linear_solver(node_q_values)
+            #         else:
+            #             C = learner.sample_candidates(eval_status, K=cfg.num_particles)
+            #             qs = learner.score_actions(eval_status, C)
+            #             c_star = C[int(np.argmax(qs))]
+            #             eval_action = linear_solver(c_star)
+            #
+            #         eval_status2, eval_r, eval_done, _ = _step_unpack(
+            #             env.step(eval_action)
+            #         )
+            #         r_scalar = (
+            #             float(np.sum(eval_r))
+            #             if isinstance(eval_r, (list, np.ndarray))
+            #             else float(eval_r)
+            #         )
+            #         ep_step_rewards.append(r_scalar)
+            #         eval_status = np.asarray(eval_status2, dtype=np.float32).reshape(-1)
+            #         if eval_done:
+            #             break
+            #
+            #     # Compute discounted return for this episode
+            #     discounts = cfg.gamma ** np.arange(len(ep_step_rewards))
+            #     disc_return = np.sum(np.array(ep_step_rewards) * discounts)
+            #     eval_disc_returns.append(disc_return)
+            #
+            # avg_disc_eval = np.mean(eval_disc_returns)
+
+            # Full detection curve evaluation (10 episodes)
+            if cfg.use_critic_only_eval:
+                # Dual evaluation mode: run both actor and critic
+                # Actor eval (use_critic_override=False)
+                x_actor, y_actor, y_std_actor, traj_rows = evaluate_detection_curve(
+                    learner, env, linear_solver, n_episodes_eval=10, gamma=cfg.gamma, use_critic_override=False
+                )
+
+                # Save actor trajectories
+                traj_path = f"{results_dir}/trajectories_ep{_ep + 1}.csv"
+                pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+
+                # Critic eval (use_critic_override=True)
+                x_critic, y_critic, y_std_critic, _ = evaluate_detection_curve(
+                    learner, env, linear_solver, n_episodes_eval=10, gamma=cfg.gamma, use_critic_override=True
+                )
+
+                # Combined plot with both actor and critic
+                plt.figure(figsize=(10, 6))
+                plt.plot(x_actor, y_actor, linestyle="-", color="tab:blue", linewidth=2, label="Actor")
+                plt.fill_between(x_actor, y_actor - y_std_actor, y_actor + y_std_actor, color="tab:blue", alpha=0.25)
+                plt.plot(x_critic, y_critic, linestyle="--", color="tab:orange", linewidth=2, label="Critic")
+                plt.fill_between(x_critic, y_critic - y_std_critic, y_critic + y_std_critic, color="tab:orange", alpha=0.25)
+                plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
+                plt.xlabel("Fraction of population tested")
+                plt.ylabel("Fraction of positive cases detected")
+                plt.title(f"Detection Curve Comparison (Episode {_ep + 1})")
+                plt.xlim(0.0, 1.0)
+                plt.ylim(0.0, 1.05)
+                plt.legend()
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                graph_path = f"{results_dir}/detection_curve_ep{_ep + 1}.png"
+                plt.savefig(graph_path, dpi=200)
+                plt.close()
+
+                print(
+                    f"  [eval] saved {graph_path}, {traj_path}"
+                )
+            else:
+                # Normal evaluation mode: run only actor eval
+                x, y, y_std, traj_rows = evaluate_detection_curve(
+                    learner, env, linear_solver, n_episodes_eval=10, gamma=cfg.gamma
+                )
+
+                # Save trajectories CSV
+                traj_path = f"{results_dir}/trajectories_ep{_ep + 1}.csv"
+                pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+
+                # Save detection curve graph
+                plt.figure(figsize=(8, 4))
+                plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
+                plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
+                plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
+                plt.xlabel("Fraction of population tested")
+                plt.ylabel("Fraction of positive cases detected")
+                plt.title(f"Detection Curve (Episode {_ep + 1})")
+                plt.xlim(0.0, 1.0)
+                plt.ylim(0.0, 1.05)
+                plt.legend()
+                plt.tight_layout()
+                graph_path = f"{results_dir}/detection_curve_ep{_ep + 1}.png"
+                plt.savefig(graph_path, dpi=200)
+                plt.close()
+
+                print(
+                    f"  [eval] saved {graph_path}, {traj_path}"
+                )
+
     print(
         f"[{_timestamp()}] Training complete | total_steps={total_steps} | "
         f"final_avg_reward={np.mean(episode_rewards[-10:]):.4f}"
@@ -235,11 +490,17 @@ def run_dpmd_rf_disease_gnn(
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
 
         for t in range(horizon):
-            C = learner.sample_candidates(status, K=cfg.num_particles)
-            qs = learner.score_actions(status, C)
-            c_star = C[int(np.argmax(qs))]
+            if cfg.use_critic_only_eval:
+                # Critic-only: use Q-values as coefficients, let linear_solver handle constraints
+                node_q_values = learner.get_node_q_values(status)
+                action = linear_solver(node_q_values)
+            else:
+                # Actor-based: sample candidates, score, pick best
+                C = learner.sample_candidates(status, K=cfg.num_particles)
+                qs = learner.score_actions(status, C)
+                c_star = C[int(np.argmax(qs))]
+                action = linear_solver(c_star)
 
-            action = linear_solver(c_star)
             status2, r, done, _ = _step_unpack(env.step(action))
             r_scalar = (
                 float(np.sum(r)) if isinstance(r, (list, np.ndarray)) else float(r)

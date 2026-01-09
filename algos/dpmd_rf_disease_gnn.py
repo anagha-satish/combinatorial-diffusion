@@ -71,6 +71,9 @@ class DPMDGraphConfig:
     # diffusion/flow steps
     flow_steps: int = 36
 
+    # evaluation mode
+    use_critic_only_eval: bool = False  # bypass actor, use critic Q-values directly
+
     # ---- graph feature dims ----
     node_in_dim: int = 3        # [unary(2), status(1)]
     edge_in_dim: int = 4        # pairwise factor flattened
@@ -307,6 +310,30 @@ class DPMDGraphDisease:
         batchK = _repeat_batch(batch, K)                                  # K graphs
         c = _to_tensor(C, self.device)                                    # [K,D]
         q = torch.minimum(self.q1(batchK, c), self.q2(batchK, c))          # [K]
+        return q.detach().cpu().numpy()
+
+    @torch.no_grad()
+    def get_node_q_values(self, obs_status: np.ndarray) -> np.ndarray:
+        """
+        Score each node individually using critic (for budget=1 critic-only eval).
+        Creates one-hot vectors for each node, scores with Q1.
+
+        obs_status: [n]
+        returns: q_values [n] - Q-value for selecting each node
+        """
+        batch = self.batch_from_status_batch(obs_status.reshape(1, -1))
+        n = self.n
+
+        # Create n one-hot vectors (normalized to unit sphere)
+        # For budget=1, each action is a single node
+        C = torch.zeros(n, n, device=self.device, dtype=torch.float32)
+        C.fill_diagonal_(1.0)  # one-hot for each node
+
+        # Repeat the batch n times to score all nodes
+        batch_rep = _repeat_batch(batch, n)
+
+        # Score with Q1 (or could use min of Q1, Q2)
+        q = self.q1(batch_rep, C)  # [n]
         return q.detach().cpu().numpy()
 
     # ------------------------------------------------------------------
