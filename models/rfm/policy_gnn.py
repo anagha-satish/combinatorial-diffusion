@@ -81,13 +81,13 @@ def _node_local_index(batch: Batch) -> Tensor:
 # ---------- RFM GNN policy ----------
 class RFMPolicyGNN(nn.Module):
     """
-    GNN velocity field version:
-      u_theta(batch_graph, z_t, t) -> tangent vector on S^{D-1}, where D = n_nodes.
-    The graph is fixed-topology; batch.x holds base node features (e.g., [unary(2), status(1)]).
-    At each time step, we augment node features with:
-      - c_t component for that node
-      - time embedding
-    Then a GINE GNN outputs per-node scalar velocity, stacked into [B,D], and projected to tangent at z_t.
+    Enhanced GNN velocity field with:
+      - Deeper architecture (6 layers default)
+      - Wider hidden (256 default)
+      - Residual connections
+      - Layer normalization
+
+    u_theta(batch_graph, z_t, t) -> tangent vector on S^{D-1}, where D = n_nodes.
     """
 
     def __init__(
@@ -95,18 +95,20 @@ class RFMPolicyGNN(nn.Module):
         node_base_dim: int,
         edge_in_dim: int,
         act_dim: int,
-        hidden: int = 128,
-        layers: int = 3,
+        hidden: int = 256,
+        layers: int = 6,
         time_dim: int = 32,
     ):
         super().__init__()
         self.act_dim = int(act_dim)
         self.node_base_dim = int(node_base_dim)
         self.edge_in_dim = int(edge_in_dim)
+        self.hidden = int(hidden)
+        self.num_layers = int(layers)
 
         self.tok = TimeEmbed(embed_dim=time_dim, L=16)
 
-        # Edge MLP to match GINE edge_dim
+        # Edge MLP
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in_dim, hidden),
             nn.ReLU(),
@@ -116,15 +118,25 @@ class RFMPolicyGNN(nn.Module):
         # Node input: base + c_scalar + tfeat
         node_in = node_base_dim + 1 + time_dim
 
+        # Input projection
+        self.input_proj = nn.Sequential(
+            nn.Linear(node_in, hidden),
+            nn.SiLU(),
+        )
+
+        # GNN layers with residual connections
         self.convs = nn.ModuleList()
-        for i in range(layers):
+        self.norms = nn.ModuleList()
+        for _ in range(self.num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden if i > 0 else node_in, hidden),
+                nn.Linear(hidden, hidden),
                 nn.SiLU(),
                 nn.Linear(hidden, hidden),
             )
             self.convs.append(GINEConv(nn=mlp, edge_dim=hidden))
+            self.norms.append(nn.LayerNorm(hidden))
 
+        # Output head
         self.out = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -164,14 +176,18 @@ class RFMPolicyGNN(nn.Module):
         # edge features
         e = self.edge_mlp(batch.edge_attr)  # [num_edges_total, hidden]
 
-        h = x
-        for conv in self.convs:
-            h = F.silu(conv(h, batch.edge_index, e))
+        # Project input to hidden dimension
+        h = self.input_proj(x)  # [num_nodes_total, hidden]
+
+        # Apply GNN layers with residual connections
+        for conv, norm in zip(self.convs, self.norms):
+            h_new = conv(h, batch.edge_index, e)  # [num_nodes_total, hidden]
+            h_new = norm(h_new)  # Layer normalization
+            h = h + F.silu(h_new)  # Residual connection
 
         v_node = self.out(h).squeeze(-1)  # [num_nodes_total]
 
         # reshape node scalars -> [B, D] (assumes fixed n_nodes per graph)
-        # This is valid for your setting ("graph topology the same, only status and c changes").
         v = v_node.view(B, D)
 
         # project to tangent at z_t
