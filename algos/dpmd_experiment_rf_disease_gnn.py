@@ -276,9 +276,7 @@ def run_dpmd_rf_disease_gnn(
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)  # [n]
 
         for _ in range(horizon):
-            C = learner.sample_candidates(
-                status, K=cfg.num_particles, use_target=False
-            )  # [K,n]
+            C = learner.sample_candidates(status, K=cfg.num_particles)  # [K,n]
             qs = learner.score_actions(status, C)  # [K]
             c_star = C[int(np.argmax(qs))]
 
@@ -321,6 +319,11 @@ def run_dpmd_rf_disease_gnn(
         learner.pretrain_critics_step(exp)
 
     # -------- Training --------
+    total_steps = 0
+    episode_rewards: List[float] = []
+    recent_losses: dict[str, List[float]] = {}
+    recent_q_values: List[float] = []
+
     # Training AUC tracking
     max_training_auc: float = 0.0
     last_eval_episode: int = -eval_cooldown_episodes  # Allow eval from episode 0
@@ -332,22 +335,18 @@ def run_dpmd_rf_disease_gnn(
     with open(auc_csv_path, "w") as f:
         f.write("episode,train_auc,train_auc_MA10\n")
 
-    total_steps = 0
-    episode_rewards: List[float] = []
-    recent_losses: dict[str, List[float]] = {}
-    recent_q_values: List[float] = []
-
     for _ep in range(int(train_updates)):
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
         ep_reward = 0.0
 
         # Track per-step metrics for training AUC
-        ep_tested_frac = []
-        ep_detected_frac = []
-        ep_cum_pos = 0.0
+        ep_cum_tests = 0
+        ep_cum_positives = 0.0
+        ep_tested_list = []
+        ep_positives_list = []
 
         for _t in range(horizon):
-            C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)
+            C = learner.sample_candidates(status, K=cfg.num_particles)
             qs = learner.score_actions(status, C)
             c_star = C[int(np.argmax(qs))]
             c_exec = rfm_service_gnn.perturb(
@@ -368,14 +367,10 @@ def run_dpmd_rf_disease_gnn(
             ep_reward += r_scalar
 
             # Track metrics for training AUC
-            ep_cum_pos += r_scalar
-            if hasattr(env, "tests_done"):
-                tests_done = float(env.tests_done)
-            else:
-                tests_done = float(np.count_nonzero(status2 > -0.5))
-            ep_tested_frac.append(tests_done / float(n))
-            total_positives = max(ep_cum_pos, 1.0)
-            ep_detected_frac.append(ep_cum_pos / total_positives)
+            ep_cum_tests += budget
+            ep_cum_positives += r_scalar
+            ep_tested_list.append(ep_cum_tests)
+            ep_positives_list.append(ep_cum_positives)
 
             buffer.add(
                 status,
@@ -403,27 +398,31 @@ def run_dpmd_rf_disease_gnn(
             if done:
                 break
 
-        episode_rewards.append(ep_reward)
-        learner.policy_version += 1
-
         # Compute training AUC for this episode
+        total_positives = ep_cum_positives if ep_cum_positives > 0 else 1.0
+        ep_tested_frac = np.array(ep_tested_list) / n
+        ep_detected_frac = np.array(ep_positives_list) / total_positives
         ep_auc = np.trapezoid(ep_detected_frac, ep_tested_frac) if len(ep_tested_frac) > 1 else 0.0
         episode_aucs.append(ep_auc)
+
+        episode_rewards.append(ep_reward)
+        learner.policy_version += 1
 
         # Compute moving average of training AUC (for logging and eval trigger)
         avg_training_auc = np.mean(episode_aucs[-10:]) if len(episode_aucs) >= 10 else 0.0
 
-        # Log to CSV
+        # Append to CSV after each episode
         with open(auc_csv_path, "a") as f:
             f.write(f"{_ep},{ep_auc:.6f},{avg_training_auc:.6f}\n")
 
         if (_ep + 1) % log_every_n_episodes == 0:
+            os.makedirs(results_dir, exist_ok=True)
+
             avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0.0
             avg_q = np.mean(recent_q_values[-50:]) if recent_q_values else 0.0
             loss_strs = " | ".join(
                 f"{k}={np.mean(v[-50:]):.4f}" for k, v in recent_losses.items() if v
             )
-            os.makedirs(results_dir, exist_ok=True)
             print(
                 f"[{_timestamp()}] episode={_ep + 1} | "
                 f"avg_reward={avg_reward:.4f} | train_auc_MA10={avg_training_auc:.4f} | avg_q={avg_q:.4f}"
@@ -431,17 +430,17 @@ def run_dpmd_rf_disease_gnn(
             )
 
         # Check for new max training AUC and run eval if cooldown allows
+        # Only trigger if we have enough episodes for a meaningful moving average
         episodes_since_last_eval = _ep - last_eval_episode
         if (len(episode_aucs) >= 10 and
             avg_training_auc > max_training_auc and
             episodes_since_last_eval >= eval_cooldown_episodes):
-
             max_training_auc = avg_training_auc
             last_eval_episode = _ep
 
             os.makedirs(results_dir, exist_ok=True)
             x, y, y_std, traj_rows = evaluate_detection_curve(
-                learner, env, linear_solver, n_episodes_eval=n_episodes_eval, gamma=cfg.gamma
+                learner, env, linear_solver, n_episodes_eval=10, gamma=cfg.gamma
             )
             eval_auc = np.trapezoid(y, x)
             save_eval_results(x, y, y_std, traj_rows, results_dir, _ep + 1)
@@ -459,11 +458,11 @@ def run_dpmd_rf_disease_gnn(
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
 
         for t in range(horizon):
-            C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)
+            C = learner.sample_candidates(status, K=cfg.num_particles)
             qs = learner.score_actions(status, C)
             c_star = C[int(np.argmax(qs))]
-
             action = linear_solver(c_star)
+
             status2, r, done, _ = _step_unpack(env.step(action))
             r_scalar = (
                 float(np.sum(r)) if isinstance(r, (list, np.ndarray)) else float(r)
