@@ -230,6 +230,14 @@ def main():
     parser.add_argument('--train_updates', type=int, default=2000)
     parser.add_argument('--batch_size', type=int, default=64)
 
+    # Logging
+    parser.add_argument(
+        '--log_every',
+        type=int,
+        default=10,
+        help='Log training metrics every N episodes',
+    )
+
     # Core RL hyperparams
     parser.add_argument('--gamma', type=float, default=0.99)
     parser.add_argument('--tau', type=float, default=0.005)
@@ -362,6 +370,7 @@ def main():
         warmup_steps=args.warmup_steps,
         batch_size=args.batch_size,
         train_updates=args.train_updates,
+        log_every_n_episodes=args.log_every,
     )
     elapsed = time.time() - t0
 
