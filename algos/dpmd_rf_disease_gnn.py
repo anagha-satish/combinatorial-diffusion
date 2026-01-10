@@ -244,29 +244,20 @@ class DPMDGraphDisease:
     # Actor sampling
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _sample_candidates(self, batch: Batch, K: int, *, use_target: bool = False) -> Tensor:
-        if use_target:
-            C_np = rfm_service_gnn.sample_target(
-                batch=batch,
-                K=K,
-                steps=self.cfg.flow_steps,
-                kappa=None,
-                J_noise=1,
-            )
-        else:
-            C_np = rfm_service_gnn.sample(
-                batch=batch,
-                K=K,
-                steps=self.cfg.flow_steps,
-                kappa=None,
-                J_noise=1,
-            )
+    def _sample_candidates(self, batch: Batch, K: int) -> Tensor:
+        C_np = rfm_service_gnn.sample(
+            batch=batch,
+            K=K,
+            steps=self.cfg.flow_steps,
+            kappa=None,
+            J_noise=1,
+        )
         return _to_tensor(C_np, self.device)  # [B,K,D]
 
     @torch.no_grad()
-    def sample_candidates(self, obs_status: np.ndarray, K: int, *, use_target: bool = False) -> np.ndarray:
+    def sample_candidates(self, obs_status: np.ndarray, K: int) -> np.ndarray:
         batch = self.batch_from_status_batch(obs_status.reshape(1, -1))
-        C = self._sample_candidates(batch, K=K, use_target=use_target)[0]  # [K,D]
+        C = self._sample_candidates(batch, K=K)[0]  # [K,D]
         return C.detach().cpu().numpy().astype(np.float32, copy=False)
 
     @torch.no_grad()
@@ -317,7 +308,7 @@ class DPMDGraphDisease:
     @torch.no_grad()
     def _smoothed_value(self, batch_next: Batch) -> Tensor:
         """
-        Smoothed V(s') computed via sampling target actor + vMF noise and target critics.
+        Smoothed V(s') computed via sampling actor + vMF noise and target critics.
         returns: [B]
         """
         B = int(batch_next.num_graphs)
@@ -326,7 +317,7 @@ class DPMDGraphDisease:
         kappa = float(self.cfg.kappa_smooth)
 
         # Cprime: [B,M,D]
-        Cprime = self._sample_candidates(batch_next, M, use_target=True)
+        Cprime = self._sample_candidates(batch_next, M)
         cm = Cprime.reshape(B * M, self.act_dim)  # [B*M,D]
 
         # vMF noise around each candidate
@@ -409,9 +400,9 @@ class DPMDGraphDisease:
         torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
         self.q_optim.step()
 
-        # 3) Actor update: sample c1 from target actor on s, weight with target critics
+        # 3) Actor update: sample c1 from actor on s, weight with target critics
         with torch.no_grad():
-            C1 = self._sample_candidates(batch_s, K=1, use_target=True)  # [B,1,D]
+            C1 = self._sample_candidates(batch_s, K=1)  # [B,1,D]
             c1 = C1[:, 0, :]                                             # [B,D]
             w = self._weights_no_smooth(batch_s, c1, lam=float(self._current_lambda()))  # [B]
 
@@ -428,18 +419,13 @@ class DPMDGraphDisease:
             alpha_loss.backward()
             self.alpha_optim.step()
 
-        # 5) soft-update target critics and target actor
+        # 5) soft-update target critics
         if (self.step % int(self.cfg.delay_update)) == 0:
             with torch.no_grad():
                 for p_t, p in zip(self.tq1.parameters(), self.q1.parameters()):
                     p_t.mul_(1.0 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
                 for p_t, p in zip(self.tq2.parameters(), self.q2.parameters()):
                     p_t.mul_(1.0 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
-
-            if hasattr(rfm_service_gnn, "soft_update_target"):
-                rfm_service_gnn.soft_update_target(self.cfg.tau)
-            elif hasattr(rfm_service_gnn, "sync_target_from_current"):
-                rfm_service_gnn.sync_target_from_current()
 
         self.step += 1
 
