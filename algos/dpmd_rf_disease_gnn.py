@@ -71,9 +71,6 @@ class DPMDGraphConfig:
     # diffusion/flow steps
     flow_steps: int = 36
 
-    # evaluation mode
-    use_critic_only_eval: bool = False  # bypass actor, use critic Q-values directly
-
     # ---- graph feature dims ----
     node_in_dim: int = 3        # [unary(2), status(1)]
     edge_in_dim: int = 4        # pairwise factor flattened

@@ -91,6 +91,41 @@ def reseed_all(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def save_final_eval_results(
+    x: np.ndarray,
+    y: np.ndarray,
+    y_std: np.ndarray,
+    traj_rows: list,
+    results_dir: str,
+    run_tag: str,
+    gamma: float,
+):
+    """Save final evaluation results: NPZ, CSV, and PNG."""
+    npz_path = f"{results_dir}/eval_results_{run_tag}.npz"
+    np.savez(npz_path, x=x, y=y, y_std=y_std)
+    print("Saved eval vectors to:", npz_path)
+
+    traj_path = f"{results_dir}/trajectories_{run_tag}.csv"
+    pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+    print("Saved trajectories to:", traj_path)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
+    plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
+    plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
+    plt.xlabel("Fraction of population tested")
+    plt.ylabel("Fraction of positive cases detected (normalized)")
+    plt.title(f"Policies with discount = {gamma}")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.05)
+    plt.legend()
+    plt.tight_layout()
+    png_path = f"{results_dir}/disease_detection_curve_{run_tag}.png"
+    plt.savefig(png_path, dpi=200)
+    print("Saved plot to:", png_path)
+    plt.close()
+
+
 # ------------------------------------------------------------------
 # Main
 # ------------------------------------------------------------------
@@ -137,6 +172,20 @@ def main():
     parser.add_argument("--train_updates", type=int, default=2000)
     parser.add_argument("--batch_size", type=int, default=64)
 
+    # Logging and evaluation
+    parser.add_argument(
+        "--log_every",
+        type=int,
+        default=10,
+        help="Log training metrics every N episodes",
+    )
+    parser.add_argument(
+        "--eval_cooldown",
+        type=int,
+        default=5,
+        help="Minimum episodes between eval calls triggered by new max training AUC",
+    )
+
     # Core RL hyperparams
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--tau", type=float, default=0.005)
@@ -167,12 +216,6 @@ def main():
         type=str,
         default=None,
         help="Path to cached graph pickle file. If provided, skips graph generation.",
-    )
-
-    parser.add_argument(
-        "--use_critic_only_eval",
-        action="store_true",
-        help="Bypass actor during evaluation; use critic Q-values directly (for budget=1 debugging)",
     )
 
     parser.add_argument(
@@ -278,7 +321,6 @@ def main():
         q_norm_clip=args.q_norm_clip,
         q_running_beta=args.q_running_beta,
         flow_steps=args.flow_steps,
-        use_critic_only_eval=args.use_critic_only_eval,
     )
 
     print("--------------------------------------------------------")
@@ -298,6 +340,8 @@ def main():
         warmup_steps=args.warmup_steps,
         batch_size=args.batch_size,
         train_updates=args.train_updates,
+        log_every_n_episodes=args.log_every,
+        eval_cooldown_episodes=args.eval_cooldown,
         results_dir=args.results_dir,
     )
     elapsed = time.time() - t0
@@ -322,101 +366,16 @@ def main():
     )
 
     # Detection curve for the trained policy
-    if args.use_critic_only_eval:
-        # Dual evaluation mode: run both actor and critic
-        # Actor eval (use_critic_override=False)
-        x_actor, y_actor, y_std_actor, traj_rows = evaluate_detection_curve(
-            learner,
-            env,
-            linear_solver,
-            n_episodes_eval=10,
-            gamma=args.gamma,
-            use_critic_override=False,
-        )
-
-        # Save actor results
-        npz_path = f"{args.results_dir}/eval_results_{run_tag}.npz"
-        np.savez(npz_path, x=x_actor, y=y_actor, y_std=y_std_actor)
-        print("Saved eval vectors (actor) to:", npz_path)
-
-        traj_path = f"{args.results_dir}/trajectories_{run_tag}.csv"
-        pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
-        print("Saved trajectories (actor) to:", traj_path)
-
-        # Critic eval (use_critic_override=True)
-        x_critic, y_critic, y_std_critic, _ = evaluate_detection_curve(
-            learner,
-            env,
-            linear_solver,
-            n_episodes_eval=10,
-            gamma=args.gamma,
-            use_critic_override=True,
-        )
-
-        # Combined plot with both actor and critic
-        plt.figure(figsize=(10, 6))
-        plt.plot(x_actor, y_actor, linestyle="-", color="tab:blue", linewidth=2, label="Actor")
-        plt.fill_between(x_actor, y_actor - y_std_actor, y_actor + y_std_actor, color="tab:blue", alpha=0.25)
-        plt.plot(x_critic, y_critic, linestyle="--", color="tab:orange", linewidth=2, label="Critic")
-        plt.fill_between(x_critic, y_critic - y_std_critic, y_critic + y_std_critic, color="tab:orange", alpha=0.25)
-        plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
-        plt.xlabel("Fraction of population tested")
-        plt.ylabel("Fraction of positive cases detected (normalized)")
-        plt.title(f"Detection Curve Comparison (gamma={args.gamma})")
-        plt.xlim(0.0, 1.0)
-        plt.ylim(0.0, 1.05)
-        plt.legend()
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        png_path = f"{args.results_dir}/disease_detection_curve_{run_tag}.png"
-        plt.savefig(png_path, dpi=200)
-        print("Saved combined plot to:", png_path)
-        plt.close()
-
-    else:
-        # Normal evaluation mode: run only actor eval
-        x, y, y_std, traj_rows = evaluate_detection_curve(
-            learner,
-            env,
-            linear_solver,
-            n_episodes_eval=10,
-            gamma=args.gamma,
-        )
-
-        # ------------------------------------------------------------------
-        # Save evaluation vectors (unique per sweep run)
-        # ------------------------------------------------------------------
-        npz_path = f"{args.results_dir}/eval_results_{run_tag}.npz"
-        np.savez(npz_path, x=x, y=y, y_std=y_std)
-        print("Saved eval vectors to:", npz_path)
-
-        # ------------------------------------------------------------------
-        # Save trajectories CSV (for overlay with random baseline)
-        # ------------------------------------------------------------------
-        traj_path = f"{args.results_dir}/trajectories_{run_tag}.csv"
-        pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
-        print("Saved trajectories to:", traj_path)
-
-        # ------------------------------------------------------------------
-        # Plot detection curve (unique per sweep run)
-        # ------------------------------------------------------------------
-        plt.figure(figsize=(8, 4))
-        plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
-        plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
-        plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
-        plt.xlabel("Fraction of population tested")
-        plt.ylabel("Fraction of positive cases detected (normalized)")
-        plt.title(f"Policies with discount = {args.gamma}")
-        plt.xlim(0.0, 1.0)
-        plt.ylim(0.0, 1.05)
-        plt.legend()
-        plt.tight_layout()
-
-        png_path = f"{args.results_dir}/disease_detection_curve_{run_tag}.png"
-        plt.savefig(png_path, dpi=200)
-        print("Saved plot to:", png_path)
-        plt.close()
+    x, y, y_std, traj_rows = evaluate_detection_curve(
+        learner,
+        env,
+        linear_solver,
+        n_episodes_eval=10,
+        gamma=args.gamma,
+    )
+    save_final_eval_results(
+        x, y, y_std, traj_rows, args.results_dir, run_tag, args.gamma
+    )
 
     # Discounted return summary (using training-time rewards)
     gamma = args.gamma
