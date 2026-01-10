@@ -126,6 +126,7 @@ class GraphQNet(nn.Module):
         self.hidden = int(hidden)
         self.num_layers = int(layers)
 
+        # Edge MLP
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in_dim, hidden),
             nn.ReLU(),
@@ -158,6 +159,7 @@ class GraphQNet(nn.Module):
             nn.Linear(hidden, 1),
         )
 
+        # Head
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -182,27 +184,27 @@ class GraphQNet(nn.Module):
         e = self.edge_mlp(batch.edge_attr)                            # [num_edges_total, hidden]
 
         # Project input to hidden dimension
-        h = self.input_proj(x)  # [num_nodes_total, hidden]
+        h = self.input_proj(x)                                        # [num_nodes_total, hidden]
 
         # Apply GNN layers with residual connections
         for conv, norm in zip(self.convs, self.norms):
-            h_new = conv(h, batch.edge_index, e)  # [num_nodes_total, hidden]
-            h_new = norm(h_new)  # Layer normalization
-            h = h + F.silu(h_new)  # Residual connection
+            h_new = conv(h, batch.edge_index, e)                      # [num_nodes_total, hidden]
+            h_new = norm(h_new)                                       # Layer normalization
+            h = h + F.silu(h_new)                                     # Residual connection
 
         # Attention-based pooling
-        attn_scores = self.pool_attn(h)  # [num_nodes_total, 1]
-        attn_weights = torch.softmax(attn_scores, dim=0)  # Softmax over all nodes
+        attn_scores = self.pool_attn(h)                               # [num_nodes_total, 1]
+        attn_weights = torch.softmax(attn_scores, dim=0)              # Softmax over all nodes in batch
 
         # Weight by batch assignment
         pooled = torch.zeros(B, self.hidden, device=h.device, dtype=h.dtype)
         for b in range(B):
             mask = (batch.batch == b)
             if mask.any():
-                h_b = h[mask]  # [num_nodes_in_graph_b, hidden]
-                attn_b = attn_weights[mask]  # [num_nodes_in_graph_b, 1]
-                attn_b = attn_b / (attn_b.sum() + 1e-8)  # Renormalize within graph
-                pooled[b] = (h_b * attn_b).sum(dim=0)  # [hidden]
+                h_b = h[mask]                                         # [num_nodes_in_graph_b, hidden]
+                attn_b = attn_weights[mask]                           # [num_nodes_in_graph_b, 1]
+                attn_b = attn_b / (attn_b.sum() + 1e-8)              # Renormalize within graph
+                pooled[b] = (h_b * attn_b).sum(dim=0)                # [hidden]
 
         q = self.head(pooled).squeeze(-1)                             # [B]
         assert q.shape[0] == B
@@ -260,9 +262,6 @@ class DPMDGraphDisease:
         self.log_alpha = nn.Parameter(torch.tensor(-0.5, device=self.device))
         self.alpha_optim = optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
 
-        # keep target actor aligned initially
-        if hasattr(rfm_service_gnn, "sync_target_from_current"):
-            rfm_service_gnn.sync_target_from_current()
 
     # ------------------------------------------------------------------
     # Build Batch from status

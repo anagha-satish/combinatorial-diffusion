@@ -133,7 +133,6 @@ class _RFMServiceGNN:
         Z_noisy = Z_noisy.reshape(B, K_ * int(J_noise), D)
         return Z_noisy.detach().cpu().numpy()
 
-
     @torch.no_grad()
     def perturb(self, mu_np: np.ndarray, kappa: float, J: int = 1) -> np.ndarray:
         """

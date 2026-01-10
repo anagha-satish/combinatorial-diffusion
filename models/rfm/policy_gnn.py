@@ -108,7 +108,7 @@ class RFMPolicyGNN(nn.Module):
 
         self.tok = TimeEmbed(embed_dim=time_dim, L=16)
 
-        # Edge MLP to match GINE edge_dim
+        # Edge MLP
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in_dim, hidden),
             nn.ReLU(),
@@ -136,6 +136,7 @@ class RFMPolicyGNN(nn.Module):
             self.convs.append(GINEConv(nn=mlp, edge_dim=hidden))
             self.norms.append(nn.LayerNorm(hidden))
 
+        # Output head
         self.out = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -187,7 +188,6 @@ class RFMPolicyGNN(nn.Module):
         v_node = self.out(h).squeeze(-1)  # [num_nodes_total]
 
         # reshape node scalars -> [B, D] (assumes fixed n_nodes per graph)
-        # This is valid for your setting ("graph topology the same, only status and c changes").
         v = v_node.view(B, D)
 
         # project to tangent at z_t
