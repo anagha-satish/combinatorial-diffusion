@@ -38,7 +38,6 @@ class _RFMServiceGNN:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.model: RFMPolicyGNN | None = None
-        self.model_target: RFMPolicyGNN | None = None
         self.optim: optim.Optimizer | None = None
 
         self.node_base_dim: int | None = None
@@ -83,19 +82,11 @@ class _RFMServiceGNN:
                 time_dim=int(time_dim),
             ).to(self.device)
 
-            self.model_target = RFMPolicyGNN(
-                node_base_dim=self.node_base_dim,
-                edge_in_dim=self.edge_in_dim,
-                act_dim=self.act_dim,
-                hidden=int(hidden),
-                layers=int(layers),
-                time_dim=int(time_dim),
-            ).to(self.device)
-
-            self.model_target.load_state_dict(self.model.state_dict())
             self.optim = optim.Adam(self.model.parameters(), lr=self.lr)
 
-    def update(self, batch: Batch, z1: Tensor | np.ndarray, w: Tensor | np.ndarray) -> float:
+    def update(
+        self, batch: Batch, z1: Tensor | np.ndarray, w: Tensor | np.ndarray
+    ) -> float:
         """
         One gradient update step for the actor.
         batch: Batch with B graphs
@@ -140,46 +131,11 @@ class _RFMServiceGNN:
 
         B, K_, D = Z.shape
         mu = Z.reshape(B * K_, D)
-        Z_noisy = _vmf_perturb_torch(mu, kappa=float(kappa), J=int(J_noise))  # [B*K,J,D]
+        Z_noisy = _vmf_perturb_torch(
+            mu, kappa=float(kappa), J=int(J_noise)
+        )  # [B*K,J,D]
         Z_noisy = Z_noisy.reshape(B, K_ * int(J_noise), D)
         return Z_noisy.detach().cpu().numpy()
-
-    @torch.no_grad()
-    def sample_target(
-        self,
-        batch: Batch,
-        K: int,
-        steps: int = 30,
-        *,
-        kappa: float | None = None,
-        J_noise: int = 1,
-    ) -> np.ndarray:
-        assert self.model_target is not None
-        batch = batch.to(self.device)
-        Z = self.model_target.sample(batch, K=K, steps=steps)  # [B,K,D]
-
-        if (kappa is None) or (J_noise <= 0) or (float(kappa) <= 0):
-            return Z.detach().cpu().numpy()
-
-        B, K_, D = Z.shape
-        mu = Z.reshape(B * K_, D)
-        Z_noisy = _vmf_perturb_torch(mu, kappa=float(kappa), J=int(J_noise))
-        Z_noisy = Z_noisy.reshape(B, K_ * int(J_noise), D)
-        return Z_noisy.detach().cpu().numpy()
-
-    @torch.no_grad()
-    def sync_target_from_current(self) -> None:
-        if self.model is None or self.model_target is None:
-            return
-        self.model_target.load_state_dict(self.model.state_dict())
-
-    @torch.no_grad()
-    def soft_update_target(self, tau: float) -> None:
-        if self.model is None or self.model_target is None:
-            return
-        with torch.no_grad():
-            for p_t, p in zip(self.model_target.parameters(), self.model.parameters()):
-                p_t.mul_(1.0 - float(tau)).add_(p, alpha=float(tau))
 
     @torch.no_grad()
     def perturb(self, mu_np: np.ndarray, kappa: float, J: int = 1) -> np.ndarray:
