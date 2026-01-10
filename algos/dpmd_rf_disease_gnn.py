@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.nn import GINEConv
 
 from models.rfm.service_gnn import rfm_service_gnn
 
@@ -113,16 +113,18 @@ def _node_local_index(batch: Batch) -> Tensor:
 # -----------------------------
 class GraphQNet(nn.Module):
     """
-    Q(s,c) as a GNN:
-      - node feature = base([unary2,status1]) concat c_scalar (1)
-      - GINE layers
-      - global mean pool -> MLP -> scalar Q per graph
+    Enhanced Q(s,c) GNN with:
+      - Deeper architecture (6 layers default)
+      - Wider hidden (256 default)
+      - Residual connections
+      - Attention-based pooling
     """
-    def __init__(self, node_base_dim: int, edge_in_dim: int, hidden: int = 128, layers: int = 3):
+    def __init__(self, node_base_dim: int, edge_in_dim: int, hidden: int = 256, layers: int = 6):
         super().__init__()
         self.node_base_dim = int(node_base_dim)
         self.edge_in_dim = int(edge_in_dim)
         self.hidden = int(hidden)
+        self.num_layers = int(layers)
 
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in_dim, hidden),
@@ -130,15 +132,31 @@ class GraphQNet(nn.Module):
             nn.Linear(hidden, hidden),
         )
 
+        # Input projection: node_in → hidden
         node_in = self.node_base_dim + 1  # + c_scalar
+        self.input_proj = nn.Sequential(
+            nn.Linear(node_in, hidden),
+            nn.SiLU(),
+        )
+
+        # GNN layers with residual connections
         self.convs = nn.ModuleList()
-        for i in range(int(layers)):
+        self.norms = nn.ModuleList()
+        for _ in range(self.num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden if i > 0 else node_in, hidden),
+                nn.Linear(hidden, hidden),
                 nn.SiLU(),
                 nn.Linear(hidden, hidden),
             )
             self.convs.append(GINEConv(nn=mlp, edge_dim=hidden))
+            self.norms.append(nn.LayerNorm(hidden))
+
+        # Attention pooling
+        self.pool_attn = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
 
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
@@ -163,11 +181,29 @@ class GraphQNet(nn.Module):
         x = torch.cat([batch.x, c_scalar], dim=-1)                    # [num_nodes_total, node_in]
         e = self.edge_mlp(batch.edge_attr)                            # [num_edges_total, hidden]
 
-        h = x
-        for conv in self.convs:
-            h = F.silu(conv(h, batch.edge_index, e))
+        # Project input to hidden dimension
+        h = self.input_proj(x)  # [num_nodes_total, hidden]
 
-        pooled = global_mean_pool(h, batch.batch)                     # [B, hidden]
+        # Apply GNN layers with residual connections
+        for conv, norm in zip(self.convs, self.norms):
+            h_new = conv(h, batch.edge_index, e)  # [num_nodes_total, hidden]
+            h_new = norm(h_new)  # Layer normalization
+            h = h + F.silu(h_new)  # Residual connection
+
+        # Attention-based pooling
+        attn_scores = self.pool_attn(h)  # [num_nodes_total, 1]
+        attn_weights = torch.softmax(attn_scores, dim=0)  # Softmax over all nodes
+
+        # Weight by batch assignment
+        pooled = torch.zeros(B, self.hidden, device=h.device, dtype=h.dtype)
+        for b in range(B):
+            mask = (batch.batch == b)
+            if mask.any():
+                h_b = h[mask]  # [num_nodes_in_graph_b, hidden]
+                attn_b = attn_weights[mask]  # [num_nodes_in_graph_b, 1]
+                attn_b = attn_b / (attn_b.sum() + 1e-8)  # Renormalize within graph
+                pooled[b] = (h_b * attn_b).sum(dim=0)  # [hidden]
+
         q = self.head(pooled).squeeze(-1)                             # [B]
         assert q.shape[0] == B
         return q
