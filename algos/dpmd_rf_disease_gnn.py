@@ -21,13 +21,13 @@ from models.rfm.service_gnn import rfm_service_gnn
 # Replay experience tuple
 # -----------------------------
 class Experience(NamedTuple):
-    obs:         np.ndarray  # [B, n]  status
-    action:      np.ndarray  # [B, n]  executed coefficient c_exec (stored in replay)
-    reward:      np.ndarray  # [B]
-    next_obs:    np.ndarray  # [B, n]  next status
-    done:        np.ndarray  # [B]
+    obs: np.ndarray  # [B, n]  status
+    action: np.ndarray  # [B, n]  executed coefficient c_exec (stored in replay)
+    reward: np.ndarray  # [B]
+    next_obs: np.ndarray  # [B, n]  next status
+    done: np.ndarray  # [B]
     action_star: np.ndarray  # [B, n]  greedy center coefficient c*
-    policy_id:   np.ndarray  # [B]
+    policy_id: np.ndarray  # [B]
 
 
 # -----------------------------
@@ -48,8 +48,8 @@ class DPMDGraphConfig:
     # Mirror-descent temperature for weights
     w_clip: Optional[float] = 4.0
     lambda_start: float = 2.0
-    lambda_end:   float = 0.8
-    lambda_steps: int   = 10_000
+    lambda_end: float = 0.8
+    lambda_steps: int = 10_000
 
     # Execution noise (on-sphere)
     kappa_exec: float = 28.0
@@ -72,8 +72,8 @@ class DPMDGraphConfig:
     flow_steps: int = 36
 
     # ---- graph feature dims ----
-    node_in_dim: int = 3        # [unary(2), status(1)]
-    edge_in_dim: int = 4        # pairwise factor flattened
+    node_in_dim: int = 3  # [unary(2), status(1)]
+    edge_in_dim: int = 4  # pairwise factor flattened
 
     # ---- critic GNN ----
     q_hidden: int = 128
@@ -119,7 +119,10 @@ class GraphQNet(nn.Module):
       - Residual connections
       - Attention-based pooling
     """
-    def __init__(self, node_base_dim: int, edge_in_dim: int, hidden: int = 256, layers: int = 6):
+
+    def __init__(
+        self, node_base_dim: int, edge_in_dim: int, hidden: int = 256, layers: int = 6
+    ):
         super().__init__()
         self.node_base_dim = int(node_base_dim)
         self.edge_in_dim = int(edge_in_dim)
@@ -177,36 +180,38 @@ class GraphQNet(nn.Module):
         D = int(c.shape[1])
 
         # broadcast c to nodes via (batch_id, local_node_id)
-        local_idx = _node_local_index(batch)                          # [num_nodes_total]
-        c_scalar = c[batch.batch, local_idx].unsqueeze(-1)            # [num_nodes_total,1]
+        local_idx = _node_local_index(batch)  # [num_nodes_total]
+        c_scalar = c[batch.batch, local_idx].unsqueeze(-1)  # [num_nodes_total,1]
 
-        x = torch.cat([batch.x, c_scalar], dim=-1)                    # [num_nodes_total, node_in]
-        e = self.edge_mlp(batch.edge_attr)                            # [num_edges_total, hidden]
+        x = torch.cat([batch.x, c_scalar], dim=-1)  # [num_nodes_total, node_in]
+        e = self.edge_mlp(batch.edge_attr)  # [num_edges_total, hidden]
 
         # Project input to hidden dimension
-        h = self.input_proj(x)                                        # [num_nodes_total, hidden]
+        h = self.input_proj(x)  # [num_nodes_total, hidden]
 
         # Apply GNN layers with residual connections
         for conv, norm in zip(self.convs, self.norms):
-            h_new = conv(h, batch.edge_index, e)                      # [num_nodes_total, hidden]
-            h_new = norm(h_new)                                       # Layer normalization
-            h = h + F.silu(h_new)                                     # Residual connection
+            h_new = conv(h, batch.edge_index, e)  # [num_nodes_total, hidden]
+            h_new = norm(h_new)  # Layer normalization
+            h = h + F.silu(h_new)  # Residual connection
 
         # Attention-based pooling
-        attn_scores = self.pool_attn(h)                               # [num_nodes_total, 1]
-        attn_weights = torch.softmax(attn_scores, dim=0)              # Softmax over all nodes in batch
+        attn_scores = self.pool_attn(h)  # [num_nodes_total, 1]
+        attn_weights = torch.softmax(
+            attn_scores, dim=0
+        )  # Softmax over all nodes in batch
 
         # Weight by batch assignment
         pooled = torch.zeros(B, self.hidden, device=h.device, dtype=h.dtype)
         for b in range(B):
-            mask = (batch.batch == b)
+            mask = batch.batch == b
             if mask.any():
-                h_b = h[mask]                                         # [num_nodes_in_graph_b, hidden]
-                attn_b = attn_weights[mask]                           # [num_nodes_in_graph_b, 1]
-                attn_b = attn_b / (attn_b.sum() + 1e-8)              # Renormalize within graph
-                pooled[b] = (h_b * attn_b).sum(dim=0)                # [hidden]
+                h_b = h[mask]  # [num_nodes_in_graph_b, hidden]
+                attn_b = attn_weights[mask]  # [num_nodes_in_graph_b, 1]
+                attn_b = attn_b / (attn_b.sum() + 1e-8)  # Renormalize within graph
+                pooled[b] = (h_b * attn_b).sum(dim=0)  # [hidden]
 
-        q = self.head(pooled).squeeze(-1)                             # [B]
+        q = self.head(pooled).squeeze(-1)  # [B]
         assert q.shape[0] == B
         return q
 
@@ -221,8 +226,8 @@ class DPMDGraphDisease:
         self,
         n_nodes: int,
         node_covariates: np.ndarray,  # [n,2]
-        edge_index: np.ndarray,       # [2, E_dir]
-        edge_attr: np.ndarray,        # [E_dir, 4]
+        edge_index: np.ndarray,  # [2, E_dir]
+        edge_attr: np.ndarray,  # [E_dir, 4]
         *,
         device: Optional[torch.device] = None,
         cfg: DPMDGraphConfig = DPMDGraphConfig(),
@@ -231,25 +236,40 @@ class DPMDGraphDisease:
         self.n = int(n_nodes)
         self.act_dim = self.n
 
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
 
         # static graph tensors
         assert node_covariates.shape == (self.n, 2)
-        self.node_cov = torch.tensor(node_covariates, dtype=torch.float32, device=self.device)  # [n,2]
-        self.edge_index = torch.tensor(edge_index, dtype=torch.long, device=self.device)        # [2,E]
-        self.edge_attr = torch.tensor(edge_attr, dtype=torch.float32, device=self.device)       # [E,4]
+        self.node_cov = torch.tensor(
+            node_covariates, dtype=torch.float32, device=self.device
+        )  # [n,2]
+        self.edge_index = torch.tensor(
+            edge_index, dtype=torch.long, device=self.device
+        )  # [2,E]
+        self.edge_attr = torch.tensor(
+            edge_attr, dtype=torch.float32, device=self.device
+        )  # [E,4]
 
         # critics + targets
-        self.q1 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
-        self.q2 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
-        self.tq1 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
-        self.tq2 = GraphQNet(cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers).to(self.device)
+        self.q1 = GraphQNet(
+            cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers
+        ).to(self.device)
+        self.q2 = GraphQNet(
+            cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers
+        ).to(self.device)
+        self.tq1 = GraphQNet(
+            cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers
+        ).to(self.device)
+        self.tq2 = GraphQNet(
+            cfg.node_in_dim, cfg.edge_in_dim, hidden=cfg.q_hidden, layers=cfg.q_layers
+        ).to(self.device)
         self.tq1.load_state_dict(self.q1.state_dict())
         self.tq2.load_state_dict(self.q2.state_dict())
 
         self.q_optim = optim.Adam(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
-            lr=cfg.lr
+            list(self.q1.parameters()) + list(self.q2.parameters()), lr=cfg.lr
         )
 
         # MD stats / policy version
@@ -262,12 +282,13 @@ class DPMDGraphDisease:
         self.log_alpha = nn.Parameter(torch.tensor(-0.5, device=self.device))
         self.alpha_optim = optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
 
-
     # ------------------------------------------------------------------
     # Build Batch from status
     # ------------------------------------------------------------------
     def _data_from_status(self, status: np.ndarray) -> Data:
-        status_feat = torch.tensor(status.astype(np.float32), device=self.device).view(self.n, 1)
+        status_feat = torch.tensor(status.astype(np.float32), device=self.device).view(
+            self.n, 1
+        )
         x = torch.cat([self.node_cov, status_feat], dim=1)  # [n,3]
         return Data(x=x, edge_index=self.edge_index, edge_attr=self.edge_attr)
 
@@ -304,9 +325,9 @@ class DPMDGraphDisease:
         """
         batch = self.batch_from_status_batch(obs_status.reshape(1, -1))  # 1 graph
         K = int(C.shape[0])
-        batchK = _repeat_batch(batch, K)                                  # K graphs
-        c = _to_tensor(C, self.device)                                    # [K,D]
-        q = torch.minimum(self.q1(batchK, c), self.q2(batchK, c))          # [K]
+        batchK = _repeat_batch(batch, K)  # K graphs
+        c = _to_tensor(C, self.device)  # [K,D]
+        q = torch.minimum(self.q1(batchK, c), self.q2(batchK, c))  # [K]
         return q.detach().cpu().numpy()
 
     # ------------------------------------------------------------------
@@ -323,8 +344,12 @@ class DPMDGraphDisease:
         q_mean_batch = q.mean()
         q_std_batch = q.std() + 1e-6
 
-        self._q_mean = (1 - self.cfg.q_running_beta) * self._q_mean + self.cfg.q_running_beta * float(q_mean_batch)
-        self._q_std  = (1 - self.cfg.q_running_beta) * self._q_std  + self.cfg.q_running_beta * float(q_std_batch)
+        self._q_mean = (
+            1 - self.cfg.q_running_beta
+        ) * self._q_mean + self.cfg.q_running_beta * float(q_mean_batch)
+        self._q_std = (
+            1 - self.cfg.q_running_beta
+        ) * self._q_std + self.cfg.q_running_beta * float(q_std_batch)
 
         q_norm_ema = (q - self._q_mean) / (self._q_std + 1e-6)
         q_norm_batch = (q - q_mean_batch) / q_std_batch
@@ -356,12 +381,14 @@ class DPMDGraphDisease:
         cm = Cprime.reshape(B * M, self.act_dim)  # [B*M,D]
 
         # vMF noise around each candidate
-        cm_tilde = rfm_service_gnn.perturb(cm.detach().cpu().numpy(), kappa=kappa, J=J)  # [B*M,J,D]
+        cm_tilde = rfm_service_gnn.perturb(
+            cm.detach().cpu().numpy(), kappa=kappa, J=J
+        )  # [B*M,J,D]
         Chat = _to_tensor(cm_tilde, self.device).reshape(B, M, J, self.act_dim)
 
         # Evaluate target critics on (B*M*J) repeated graphs
-        batch_rep = _repeat_batch(batch_next, M * J)                 # [B*M*J graphs]
-        flat_c = Chat.reshape(B * M * J, self.act_dim)               # [B*M*J,D]
+        batch_rep = _repeat_batch(batch_next, M * J)  # [B*M*J graphs]
+        flat_c = Chat.reshape(B * M * J, self.act_dim)  # [B*M*J,D]
 
         q1 = self.tq1(batch_rep, flat_c).view(B, M, J)
         q2 = self.tq2(batch_rep, flat_c).view(B, M, J)
@@ -376,25 +403,28 @@ class DPMDGraphDisease:
     # -----------------------------------------------------
     # Pretrain critics (myopic): y=r
     # -----------------------------------------------------
-    def pretrain_critics_step(self, batch: Experience, huber_delta: float = 5.0) -> float:
-        s = _to_tensor(batch.obs, self.device)               # [B,n]
-        c_clean = _to_tensor(batch.action_star, self.device) # [B,n]
-        y = _to_tensor(batch.reward, self.device).view(-1)   # [B]
+    def pretrain_critics_step(
+        self, batch: Experience, huber_delta: float = 5.0
+    ) -> float:
+        s = _to_tensor(batch.obs, self.device)  # [B,n]
+        c_clean = _to_tensor(batch.action_star, self.device)  # [B,n]
+        y = _to_tensor(batch.reward, self.device).view(-1)  # [B]
 
         batch_graph = self.batch_from_status_batch(s.detach().cpu().numpy())
 
         def huber(a, b, delta=huber_delta):
             x = a - b
             ax = torch.abs(x)
-            return torch.where(ax < delta, 0.5*x*x, delta*(ax - 0.5*delta)).mean()
+            return torch.where(
+                ax < delta, 0.5 * x * x, delta * (ax - 0.5 * delta)
+            ).mean()
 
         self.q_optim.zero_grad(set_to_none=True)
         q1_loss = huber(self.q1(batch_graph, c_clean), y)
         q2_loss = huber(self.q2(batch_graph, c_clean), y)
         (q1_loss + q2_loss).backward()
         torch.nn.utils.clip_grad_norm_(
-            list(self.q1.parameters()) + list(self.q2.parameters()),
-            10.0
+            list(self.q1.parameters()) + list(self.q2.parameters()), 10.0
         )
         self.q_optim.step()
 
@@ -408,11 +438,13 @@ class DPMDGraphDisease:
     # Main update
     # -----------------------------------------------------
     def update(self, batch: Experience) -> Dict[str, float]:
-        s      = _to_tensor(batch.obs,      self.device)              # [B,n]
-        c_star = _to_tensor(batch.action_star, self.device)           # [B,n]
-        rew    = _to_tensor(batch.reward,  self.device).view(-1) * float(self.cfg.reward_scale)
-        s_next = _to_tensor(batch.next_obs, self.device)              # [B,n]
-        done   = _to_tensor(batch.done,    self.device).view(-1)
+        s = _to_tensor(batch.obs, self.device)  # [B,n]
+        c_star = _to_tensor(batch.action_star, self.device)  # [B,n]
+        rew = _to_tensor(batch.reward, self.device).view(-1) * float(
+            self.cfg.reward_scale
+        )
+        s_next = _to_tensor(batch.next_obs, self.device)  # [B,n]
+        done = _to_tensor(batch.done, self.device).view(-1)
 
         batch_s = self.batch_from_status_batch(s.detach().cpu().numpy())
         batch_sn = self.batch_from_status_batch(s_next.detach().cpu().numpy())
@@ -426,31 +458,45 @@ class DPMDGraphDisease:
         def huber(a, b, delta=5.0):
             x = a - b
             ax = torch.abs(x)
-            return torch.where(ax < delta, 0.5*x*x, delta*(ax - 0.5*delta)).mean()
+            return torch.where(
+                ax < delta, 0.5 * x * x, delta * (ax - 0.5 * delta)
+            ).mean()
 
         self.q_optim.zero_grad(set_to_none=True)
         q1_loss = huber(self.q1(batch_s, c_star), y)
         q2_loss = huber(self.q2(batch_s, c_star), y)
         (q1_loss + q2_loss).backward()
-        torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
+        torch.nn.utils.clip_grad_norm_(
+            list(self.q1.parameters()) + list(self.q2.parameters()), 10.0
+        )
         self.q_optim.step()
 
         # 3) Actor update: sample c1 from actor on s, weight with target critics
         with torch.no_grad():
             C1 = self._sample_candidates(batch_s, K=1)  # [B,1,D]
-            c1 = C1[:, 0, :]                                             # [B,D]
-            w = self._weights_no_smooth(batch_s, c1, lam=float(self._current_lambda()))  # [B]
+            c1 = C1[:, 0, :]  # [B,D]
+            w = self._weights_no_smooth(
+                batch_s, c1, lam=float(self._current_lambda())
+            )  # [B]
 
         policy_loss = rfm_service_gnn.update(batch_s, c1, w)
 
         # 4.5) delayed temperature update (keep your old heuristic)
         if (self.step % max(1, int(self.cfg.delay_alpha_update))) == 0:
             self.alpha_optim.zero_grad(set_to_none=True)
-            approx_entropy = 0.5 * self.act_dim * torch.log(
-                torch.tensor(2.0 * np.pi * np.e, device=self.device, dtype=torch.float32)
-                * (0.1 * torch.exp(self.log_alpha)).pow(2)
+            approx_entropy = (
+                0.5
+                * self.act_dim
+                * torch.log(
+                    torch.tensor(
+                        2.0 * np.pi * np.e, device=self.device, dtype=torch.float32
+                    )
+                    * (0.1 * torch.exp(self.log_alpha)).pow(2)
+                )
             )
-            alpha_loss = -self.log_alpha * (-approx_entropy.detach() + float(self.cfg.target_entropy))
+            alpha_loss = -self.log_alpha * (
+                -approx_entropy.detach() + float(self.cfg.target_entropy)
+            )
             alpha_loss.backward()
             self.alpha_optim.step()
 

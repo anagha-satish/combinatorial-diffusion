@@ -84,7 +84,9 @@ class _RFMServiceGNN:
 
             self.optim = optim.Adam(self.model.parameters(), lr=self.lr)
 
-    def update(self, batch: Batch, z1: Tensor | np.ndarray, w: Tensor | np.ndarray) -> float:
+    def update(
+        self, batch: Batch, z1: Tensor | np.ndarray, w: Tensor | np.ndarray
+    ) -> float:
         """
         One gradient update step for the actor.
         batch: Batch with B graphs
@@ -129,7 +131,9 @@ class _RFMServiceGNN:
 
         B, K_, D = Z.shape
         mu = Z.reshape(B * K_, D)
-        Z_noisy = _vmf_perturb_torch(mu, kappa=float(kappa), J=int(J_noise))  # [B*K,J,D]
+        Z_noisy = _vmf_perturb_torch(
+            mu, kappa=float(kappa), J=int(J_noise)
+        )  # [B*K,J,D]
         Z_noisy = Z_noisy.reshape(B, K_ * int(J_noise), D)
         return Z_noisy.detach().cpu().numpy()
 
