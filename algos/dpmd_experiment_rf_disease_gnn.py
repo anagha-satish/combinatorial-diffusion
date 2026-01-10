@@ -1,9 +1,13 @@
 # algos/dpmd_experiment_rf_disease_gnn.py
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from typing import List, Tuple
+
+import matplotlib.pyplot as plt
 import numpy as np
+import pandas as pd
 import torch
 
 from algos.replay_buffer import ReplayBuffer
@@ -60,6 +64,169 @@ def build_graph_features_from_env(env) -> Tuple[np.ndarray, np.ndarray, np.ndarr
     return node_cov, edge_index_dir, edge_attr_dir
 
 
+def evaluate_detection_curve(
+    learner,
+    env,
+    linear_solver,
+    n_episodes_eval: int = 25,
+    gamma: float = 0.99,
+):
+    """
+    Evaluate a trained DPMD policy on the disease environment.
+
+    Returns:
+        x: [T] mean fraction of population tested
+        y: [T] mean fraction of positive cases detected (normalized)
+        y_std: [T] std of fraction detected across episodes
+        traj_rows: list of dicts for CSV export (matching random driver format)
+    """
+    n = getattr(env, "num_nodes", getattr(env, "n", None))
+    if n is None:
+        raise AttributeError("Env must have attribute `num_nodes` or `n`.")
+
+    B = int(getattr(env, "budget", 1))
+    max_steps = int(np.ceil(n / B)) + 1
+
+    all_tested = []
+    all_detected = []
+    traj_rows = []
+
+    for ep in range(n_episodes_eval):
+        reset_out = env.reset()
+        if isinstance(reset_out, tuple):
+            obs = reset_out[0]
+        else:
+            obs = reset_out
+        obs = np.asarray(obs, dtype=np.float32).reshape(-1)
+
+        step_rewards = []
+        cum_tests_list = []
+        cum_pos_list = []
+        tested_frac = []
+        cum_pos = 0.0
+
+        for _ in range(max_steps):
+            Cs = learner.sample_candidates(obs, K=learner.cfg.num_particles)
+            qs = learner.score_actions(obs, Cs)
+            j = int(np.argmax(qs))
+            c_star = Cs[j]
+            action = linear_solver(c_star)
+
+            step_out = env.step(action)
+
+            if isinstance(step_out, tuple) and len(step_out) == 4:
+                a, b, c, d = step_out
+                if isinstance(b, np.ndarray) and b.shape == np.asarray(a).shape:
+                    next_obs = a
+                    reward = c
+                    done = d
+                else:
+                    next_obs = a
+                    reward = b
+                    done = c
+            elif isinstance(step_out, tuple) and len(step_out) == 5:
+                next_obs, reward, terminated, truncated, _info = step_out
+                done = bool(terminated or truncated)
+            else:
+                try:
+                    next_obs, reward, done = step_out[0], step_out[1], step_out[2]
+                except Exception:
+                    break
+
+            r_scalar = float(reward)
+            cum_pos += r_scalar
+            obs = np.asarray(next_obs, dtype=np.float32).reshape(-1)
+
+            if hasattr(env, "tests_done"):
+                tests_done = float(env.tests_done)
+            else:
+                status = obs
+                tests_done = float(np.count_nonzero(status > -0.5))
+
+            step_rewards.append(r_scalar)
+            cum_tests_list.append(tests_done)
+            cum_pos_list.append(cum_pos)
+            tested_frac.append(tests_done / float(n))
+
+            if done:
+                break
+
+        if len(step_rewards) == 0:
+            step_rewards = [0.0]
+            cum_tests_list = [0.0]
+            cum_pos_list = [0.0]
+            tested_frac = [0.0]
+
+        total_pos = max(cum_pos_list[-1], 1.0)
+        detected_frac = [cp / total_pos for cp in cum_pos_list]
+
+        # Compute discounted cumulative reward
+        discounts = gamma ** np.arange(len(step_rewards))
+        disc_cum = np.cumsum(np.array(step_rewards) * discounts)
+
+        # Build trajectory rows for this episode
+        for t in range(len(step_rewards)):
+            traj_rows.append(
+                {
+                    "episode": ep,
+                    "step": t,
+                    "reward": step_rewards[t],
+                    "discounted_cum_reward": disc_cum[t],
+                    "cum_tests": cum_tests_list[t],
+                    "cum_positives": cum_pos_list[t],
+                    "frac_tested": tested_frac[t],
+                    "frac_detected": detected_frac[t],
+                }
+            )
+
+        # Pad to max_steps for averaging
+        while len(tested_frac) < max_steps:
+            tested_frac.append(tested_frac[-1])
+            detected_frac.append(detected_frac[-1])
+
+        all_tested.append(tested_frac)
+        all_detected.append(detected_frac)
+
+    all_tested = np.array(all_tested)
+    all_detected = np.array(all_detected)
+
+    x = all_tested.mean(axis=0)
+    y = all_detected.mean(axis=0)
+    y_std = all_detected.std(axis=0)
+
+    return x, y, y_std, traj_rows
+
+
+def save_eval_results(
+    x: np.ndarray,
+    y: np.ndarray,
+    y_std: np.ndarray,
+    traj_rows: list,
+    results_dir: str,
+    episode: int,
+):
+    """Save detection curve plot and trajectory CSV."""
+    traj_path = f"{results_dir}/trajectories_ep{episode}.csv"
+    pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+
+    plt.figure(figsize=(8, 4))
+    plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
+    plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
+    plt.axvline(x=0.5, linestyle=":", color="gray", alpha=0.7)
+    plt.xlabel("Fraction of population tested")
+    plt.ylabel("Fraction of positive cases detected")
+    plt.title(f"Detection Curve (Episode {episode})")
+    plt.xlim(0.0, 1.0)
+    plt.ylim(0.0, 1.05)
+    plt.legend()
+    plt.tight_layout()
+    graph_path = f"{results_dir}/detection_curve_ep{episode}.png"
+    plt.savefig(graph_path, dpi=200)
+    plt.close()
+
+    print(f"  [eval] saved {graph_path}, {traj_path}")
+
+
 def run_dpmd_rf_disease_gnn(
     env,
     horizon: int,
@@ -73,6 +240,8 @@ def run_dpmd_rf_disease_gnn(
     batch_size: int,
     train_updates: int,
     log_every_n_episodes: int = 10,
+    eval_cooldown_episodes: int = 5,
+    results_dir: str = "results",
 ) -> Tuple[np.ndarray, DPMDGraphDisease]:
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -152,6 +321,17 @@ def run_dpmd_rf_disease_gnn(
         learner.pretrain_critics_step(exp)
 
     # -------- Training --------
+    # Training AUC tracking
+    max_training_auc: float = 0.0
+    last_eval_episode: int = -eval_cooldown_episodes  # Allow eval from episode 0
+    episode_aucs: List[float] = []
+
+    # CSV logging for training AUC
+    os.makedirs(results_dir, exist_ok=True)
+    auc_csv_path = f"{results_dir}/training_auc.csv"
+    with open(auc_csv_path, "w") as f:
+        f.write("episode,train_auc,train_auc_MA10\n")
+
     total_steps = 0
     episode_rewards: List[float] = []
     recent_losses: dict[str, List[float]] = {}
@@ -160,6 +340,11 @@ def run_dpmd_rf_disease_gnn(
     for _ep in range(int(train_updates)):
         status = np.asarray(_reset_obs(env), dtype=np.float32).reshape(-1)
         ep_reward = 0.0
+
+        # Track per-step metrics for training AUC
+        ep_tested_frac = []
+        ep_detected_frac = []
+        ep_cum_pos = 0.0
 
         for _t in range(horizon):
             C = learner.sample_candidates(status, K=cfg.num_particles, use_target=False)
@@ -181,6 +366,16 @@ def run_dpmd_rf_disease_gnn(
                 else float(rew)
             )
             ep_reward += r_scalar
+
+            # Track metrics for training AUC
+            ep_cum_pos += r_scalar
+            if hasattr(env, "tests_done"):
+                tests_done = float(env.tests_done)
+            else:
+                tests_done = float(np.count_nonzero(status2 > -0.5))
+            ep_tested_frac.append(tests_done / float(n))
+            total_positives = max(ep_cum_pos, 1.0)
+            ep_detected_frac.append(ep_cum_pos / total_positives)
 
             buffer.add(
                 status,
@@ -211,22 +406,51 @@ def run_dpmd_rf_disease_gnn(
         episode_rewards.append(ep_reward)
         learner.policy_version += 1
 
+        # Compute training AUC for this episode
+        ep_auc = np.trapezoid(ep_detected_frac, ep_tested_frac) if len(ep_tested_frac) > 1 else 0.0
+        episode_aucs.append(ep_auc)
+
+        # Compute moving average of training AUC (for logging and eval trigger)
+        avg_training_auc = np.mean(episode_aucs[-10:]) if len(episode_aucs) >= 10 else 0.0
+
+        # Log to CSV
+        with open(auc_csv_path, "a") as f:
+            f.write(f"{_ep},{ep_auc:.6f},{avg_training_auc:.6f}\n")
+
         if (_ep + 1) % log_every_n_episodes == 0:
             avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0.0
             avg_q = np.mean(recent_q_values[-50:]) if recent_q_values else 0.0
             loss_strs = " | ".join(
                 f"{k}={np.mean(v[-50:]):.4f}" for k, v in recent_losses.items() if v
             )
+            os.makedirs(results_dir, exist_ok=True)
             print(
                 f"[{_timestamp()}] episode={_ep + 1} | "
-                f"avg_reward={avg_reward:.4f} | avg_q={avg_q:.4f} | "
-                f"buffer_size={buffer.size_filled}"
+                f"avg_reward={avg_reward:.4f} | train_auc_MA10={avg_training_auc:.4f} | avg_q={avg_q:.4f}"
                 + (f" | {loss_strs}" if loss_strs else "")
             )
 
+        # Check for new max training AUC and run eval if cooldown allows
+        episodes_since_last_eval = _ep - last_eval_episode
+        if (len(episode_aucs) >= 10 and
+            avg_training_auc > max_training_auc and
+            episodes_since_last_eval >= eval_cooldown_episodes):
+
+            max_training_auc = avg_training_auc
+            last_eval_episode = _ep
+
+            os.makedirs(results_dir, exist_ok=True)
+            x, y, y_std, traj_rows = evaluate_detection_curve(
+                learner, env, linear_solver, n_episodes_eval=n_episodes_eval, gamma=cfg.gamma
+            )
+            eval_auc = np.trapezoid(y, x)
+            save_eval_results(x, y, y_std, traj_rows, results_dir, _ep + 1)
+            print(f"  [new max] train_auc_MA10={avg_training_auc:.4f} -> eval_auc={eval_auc:.4f}")
+
     print(
         f"[{_timestamp()}] Training complete | total_steps={total_steps} | "
-        f"final_avg_reward={np.mean(episode_rewards[-10:]):.4f}"
+        f"final_avg_reward={np.mean(episode_rewards[-10:]):.4f} | "
+        f"final_train_auc_MA10={np.mean(episode_aucs[-10:]):.4f}"
     )
 
     # -------- Greedy eval (no exec noise) --------
