@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch import Tensor
 
 from torch_geometric.data import Data, Batch
-from torch_geometric.nn import GINEConv, global_mean_pool
+from torch_geometric.nn import GINEConv
 
 from models.rfm.service_gnn import rfm_service_gnn
 
@@ -71,6 +71,9 @@ class DPMDGraphConfig:
     # diffusion/flow steps
     flow_steps: int = 36
 
+    # evaluation mode
+    use_critic_only_eval: bool = False  # bypass actor, use critic Q-values directly
+
     # ---- graph feature dims ----
     node_in_dim: int = 3        # [unary(2), status(1)]
     edge_in_dim: int = 4        # pairwise factor flattened
@@ -113,33 +116,53 @@ def _node_local_index(batch: Batch) -> Tensor:
 # -----------------------------
 class GraphQNet(nn.Module):
     """
-    Q(s,c) as a GNN:
-      - node feature = base([unary2,status1]) concat c_scalar (1)
-      - GINE layers
-      - global mean pool -> MLP -> scalar Q per graph
+    Enhanced Q(s,c) GNN with:
+      - Deeper architecture (6 layers default)
+      - Wider hidden (256 default)
+      - Residual connections
+      - Attention-based pooling
     """
-    def __init__(self, node_base_dim: int, edge_in_dim: int, hidden: int = 128, layers: int = 3):
+    def __init__(self, node_base_dim: int, edge_in_dim: int, hidden: int = 256, layers: int = 6):
         super().__init__()
         self.node_base_dim = int(node_base_dim)
         self.edge_in_dim = int(edge_in_dim)
         self.hidden = int(hidden)
+        self.num_layers = int(layers)
 
+        # Edge MLP
         self.edge_mlp = nn.Sequential(
             nn.Linear(edge_in_dim, hidden),
             nn.ReLU(),
             nn.Linear(hidden, hidden),
         )
 
+        # Input projection: node_in → hidden
         node_in = self.node_base_dim + 1  # + c_scalar
+        self.input_proj = nn.Sequential(
+            nn.Linear(node_in, hidden),
+            nn.SiLU(),
+        )
+
+        # GNN layers with residual connections
         self.convs = nn.ModuleList()
-        for i in range(int(layers)):
+        self.norms = nn.ModuleList()
+        for _ in range(self.num_layers):
             mlp = nn.Sequential(
-                nn.Linear(hidden if i > 0 else node_in, hidden),
+                nn.Linear(hidden, hidden),
                 nn.SiLU(),
                 nn.Linear(hidden, hidden),
             )
             self.convs.append(GINEConv(nn=mlp, edge_dim=hidden))
+            self.norms.append(nn.LayerNorm(hidden))
 
+        # Attention pooling
+        self.pool_attn = nn.Sequential(
+            nn.Linear(hidden, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+
+        # Head
         self.head = nn.Sequential(
             nn.Linear(hidden, hidden),
             nn.SiLU(),
@@ -163,11 +186,29 @@ class GraphQNet(nn.Module):
         x = torch.cat([batch.x, c_scalar], dim=-1)                    # [num_nodes_total, node_in]
         e = self.edge_mlp(batch.edge_attr)                            # [num_edges_total, hidden]
 
-        h = x
-        for conv in self.convs:
-            h = F.silu(conv(h, batch.edge_index, e))
+        # Project input to hidden dimension
+        h = self.input_proj(x)                                        # [num_nodes_total, hidden]
 
-        pooled = global_mean_pool(h, batch.batch)                     # [B, hidden]
+        # Apply GNN layers with residual connections
+        for conv, norm in zip(self.convs, self.norms):
+            h_new = conv(h, batch.edge_index, e)                      # [num_nodes_total, hidden]
+            h_new = norm(h_new)                                       # Layer normalization
+            h = h + F.silu(h_new)                                     # Residual connection
+
+        # Attention-based pooling
+        attn_scores = self.pool_attn(h)                               # [num_nodes_total, 1]
+        attn_weights = torch.softmax(attn_scores, dim=0)              # Softmax over all nodes in batch
+
+        # Weight by batch assignment
+        pooled = torch.zeros(B, self.hidden, device=h.device, dtype=h.dtype)
+        for b in range(B):
+            mask = (batch.batch == b)
+            if mask.any():
+                h_b = h[mask]                                         # [num_nodes_in_graph_b, hidden]
+                attn_b = attn_weights[mask]                           # [num_nodes_in_graph_b, 1]
+                attn_b = attn_b / (attn_b.sum() + 1e-8)              # Renormalize within graph
+                pooled[b] = (h_b * attn_b).sum(dim=0)                # [hidden]
+
         q = self.head(pooled).squeeze(-1)                             # [B]
         assert q.shape[0] == B
         return q
@@ -224,9 +265,6 @@ class DPMDGraphDisease:
         self.log_alpha = nn.Parameter(torch.tensor(-0.5, device=self.device))
         self.alpha_optim = optim.Adam([self.log_alpha], lr=cfg.alpha_lr)
 
-        # keep target actor aligned initially
-        if hasattr(rfm_service_gnn, "sync_target_from_current"):
-            rfm_service_gnn.sync_target_from_current()
 
     # ------------------------------------------------------------------
     # Build Batch from status
@@ -244,29 +282,20 @@ class DPMDGraphDisease:
     # Actor sampling
     # ------------------------------------------------------------------
     @torch.no_grad()
-    def _sample_candidates(self, batch: Batch, K: int, *, use_target: bool = False) -> Tensor:
-        if use_target:
-            C_np = rfm_service_gnn.sample_target(
-                batch=batch,
-                K=K,
-                steps=self.cfg.flow_steps,
-                kappa=None,
-                J_noise=1,
-            )
-        else:
-            C_np = rfm_service_gnn.sample(
-                batch=batch,
-                K=K,
-                steps=self.cfg.flow_steps,
-                kappa=None,
-                J_noise=1,
-            )
+    def _sample_candidates(self, batch: Batch, K: int) -> Tensor:
+        C_np = rfm_service_gnn.sample(
+            batch=batch,
+            K=K,
+            steps=self.cfg.flow_steps,
+            kappa=None,
+            J_noise=1,
+        )
         return _to_tensor(C_np, self.device)  # [B,K,D]
 
     @torch.no_grad()
-    def sample_candidates(self, obs_status: np.ndarray, K: int, *, use_target: bool = False) -> np.ndarray:
+    def sample_candidates(self, obs_status: np.ndarray, K: int) -> np.ndarray:
         batch = self.batch_from_status_batch(obs_status.reshape(1, -1))
-        C = self._sample_candidates(batch, K=K, use_target=use_target)[0]  # [K,D]
+        C = self._sample_candidates(batch, K=K)[0]  # [K,D]
         return C.detach().cpu().numpy().astype(np.float32, copy=False)
 
     @torch.no_grad()
@@ -281,6 +310,30 @@ class DPMDGraphDisease:
         batchK = _repeat_batch(batch, K)                                  # K graphs
         c = _to_tensor(C, self.device)                                    # [K,D]
         q = torch.minimum(self.q1(batchK, c), self.q2(batchK, c))          # [K]
+        return q.detach().cpu().numpy()
+
+    @torch.no_grad()
+    def get_node_q_values(self, obs_status: np.ndarray) -> np.ndarray:
+        """
+        Score each node individually using critic (for budget=1 critic-only eval).
+        Creates one-hot vectors for each node, scores with Q1.
+
+        obs_status: [n]
+        returns: q_values [n] - Q-value for selecting each node
+        """
+        batch = self.batch_from_status_batch(obs_status.reshape(1, -1))
+        n = self.n
+
+        # Create n one-hot vectors (normalized to unit sphere)
+        # For budget=1, each action is a single node
+        C = torch.zeros(n, n, device=self.device, dtype=torch.float32)
+        C.fill_diagonal_(1.0)  # one-hot for each node
+
+        # Repeat the batch n times to score all nodes
+        batch_rep = _repeat_batch(batch, n)
+
+        # Score with Q1 (or could use min of Q1, Q2)
+        q = self.q1(batch_rep, C)  # [n]
         return q.detach().cpu().numpy()
 
     # ------------------------------------------------------------------
@@ -317,7 +370,7 @@ class DPMDGraphDisease:
     @torch.no_grad()
     def _smoothed_value(self, batch_next: Batch) -> Tensor:
         """
-        Smoothed V(s') computed via sampling target actor + vMF noise and target critics.
+        Smoothed V(s') computed via sampling actor + vMF noise and target critics.
         returns: [B]
         """
         B = int(batch_next.num_graphs)
@@ -326,7 +379,7 @@ class DPMDGraphDisease:
         kappa = float(self.cfg.kappa_smooth)
 
         # Cprime: [B,M,D]
-        Cprime = self._sample_candidates(batch_next, M, use_target=True)
+        Cprime = self._sample_candidates(batch_next, M)
         cm = Cprime.reshape(B * M, self.act_dim)  # [B*M,D]
 
         # vMF noise around each candidate
@@ -409,9 +462,9 @@ class DPMDGraphDisease:
         torch.nn.utils.clip_grad_norm_(list(self.q1.parameters()) + list(self.q2.parameters()), 10.0)
         self.q_optim.step()
 
-        # 3) Actor update: sample c1 from target actor on s, weight with target critics
+        # 3) Actor update: sample c1 from actor on s, weight with target critics
         with torch.no_grad():
-            C1 = self._sample_candidates(batch_s, K=1, use_target=True)  # [B,1,D]
+            C1 = self._sample_candidates(batch_s, K=1)  # [B,1,D]
             c1 = C1[:, 0, :]                                             # [B,D]
             w = self._weights_no_smooth(batch_s, c1, lam=float(self._current_lambda()))  # [B]
 
@@ -428,18 +481,13 @@ class DPMDGraphDisease:
             alpha_loss.backward()
             self.alpha_optim.step()
 
-        # 5) soft-update target critics and target actor
+        # 5) soft-update target critics
         if (self.step % int(self.cfg.delay_update)) == 0:
             with torch.no_grad():
                 for p_t, p in zip(self.tq1.parameters(), self.q1.parameters()):
                     p_t.mul_(1.0 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
                 for p_t, p in zip(self.tq2.parameters(), self.q2.parameters()):
                     p_t.mul_(1.0 - self.cfg.tau).add_(p, alpha=self.cfg.tau)
-
-            if hasattr(rfm_service_gnn, "soft_update_target"):
-                rfm_service_gnn.soft_update_target(self.cfg.tau)
-            elif hasattr(rfm_service_gnn, "sync_target_from_current"):
-                rfm_service_gnn.sync_target_from_current()
 
         self.step += 1
 
