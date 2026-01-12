@@ -109,6 +109,11 @@ def save_final_eval_results(
     pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
     print("Saved trajectories to:", traj_path)
 
+    # Add (0,0) as starting point
+    x = np.concatenate([[0.0], x])
+    y = np.concatenate([[0.0], y])
+    y_std = np.concatenate([[0.0], y_std])
+
     plt.figure(figsize=(8, 4))
     plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
     plt.fill_between(x, y - y_std, y + y_std, color="tab:blue", alpha=0.25)
@@ -179,12 +184,6 @@ def main():
         default=10,
         help="Log training metrics every N episodes",
     )
-    parser.add_argument(
-        "--eval_cooldown",
-        type=int,
-        default=5,
-        help="Minimum episodes between eval calls triggered by new max training AUC",
-    )
 
     # Core RL hyperparams
     parser.add_argument("--gamma", type=float, default=0.99)
@@ -228,6 +227,18 @@ def main():
     args = parser.parse_args()
 
     reseed_all(args.seed)
+
+    # Create run_tag early (before training)
+    run_tag = (
+        f"{args.std_name}"
+        f"_T{args.cc_threshold}"
+        f"_B{args.budget}"
+        f"_gamma{args.gamma}"
+        f"_seed{args.seed}"
+        f"_train{args.train_updates}"
+        f"_flow{args.flow_steps}"
+        f"_K{args.num_particles}"
+    )
 
     print("--------------------------------------------------------")
     print("Load Disease Graph")
@@ -328,8 +339,8 @@ def main():
     print("--------------------------------------------------------")
 
     t0 = time.time()
-    # IMPORTANT: run_dpmd_only must return (rewards_array, learner)
-    rewards, learner = run_dpmd_rf_disease_gnn(
+    # IMPORTANT: run_dpmd_only must return (rewards_array, learner, best_eval_auc, best_eval_episode)
+    rewards, learner, best_eval_auc, best_eval_episode = run_dpmd_rf_disease_gnn(
         env,
         horizon=horizon,
         budget=args.budget,
@@ -341,8 +352,8 @@ def main():
         batch_size=args.batch_size,
         train_updates=args.train_updates,
         log_every_n_episodes=args.log_every,
-        eval_cooldown_episodes=args.eval_cooldown,
         results_dir=args.results_dir,
+        run_tag=run_tag,
     )
     elapsed = time.time() - t0
 
@@ -350,20 +361,6 @@ def main():
     # Ensure results directory exists
     # ------------------------------------------------------------------
     os.makedirs(args.results_dir, exist_ok=True)
-
-    # ------------------------------------------------------------------
-    # Unique run tag for sweeps (already correct)
-    # ------------------------------------------------------------------
-    run_tag = (
-        f"{args.std_name}"
-        f"_T{args.cc_threshold}"
-        f"_B{args.budget}"
-        f"_gamma{args.gamma}"
-        f"_seed{args.seed}"
-        f"_train{args.train_updates}"
-        f"_flow{args.flow_steps}"
-        f"_K{args.num_particles}"
-    )
 
     # Detection curve for the trained policy
     x, y, y_std, traj_rows = evaluate_detection_curve(
@@ -404,6 +401,8 @@ def main():
     print(
         f"  episodes: {disc_returns.size}, mean discounted return = {mean_disc:.4f}, std = {std_disc:.4f}"
     )
+    if best_eval_episode > 0:
+        print(f"  best eval AUC: {best_eval_auc:.4f} (achieved at episode {best_eval_episode})")
     print(f"  runtime: {elapsed:.2f} seconds")
     print("[done]")
 
