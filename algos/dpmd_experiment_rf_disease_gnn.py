@@ -204,10 +204,16 @@ def save_eval_results(
     traj_rows: list,
     results_dir: str,
     episode: int,
+    run_tag: str = "",
 ):
     """Save detection curve plot and trajectory CSV."""
-    traj_path = f"{results_dir}/trajectories_ep{episode}.csv"
+    traj_path = f"{results_dir}/trajectories_ep{episode}_{run_tag}.csv"
     pd.DataFrame(traj_rows).to_csv(traj_path, index=False)
+
+    # Add (0,0) as starting point
+    x = np.concatenate([[0.0], x])
+    y = np.concatenate([[0.0], y])
+    y_std = np.concatenate([[0.0], y_std])
 
     plt.figure(figsize=(8, 4))
     plt.plot(x, y, linestyle="-", color="tab:blue", label="DPMD-RF")
@@ -220,11 +226,9 @@ def save_eval_results(
     plt.ylim(0.0, 1.05)
     plt.legend()
     plt.tight_layout()
-    graph_path = f"{results_dir}/detection_curve_ep{episode}.png"
+    graph_path = f"{results_dir}/detection_curve_ep{episode}_{run_tag}.png"
     plt.savefig(graph_path, dpi=200)
     plt.close()
-
-    print(f"  [eval] saved {graph_path}, {traj_path}")
 
 
 def run_dpmd_rf_disease_gnn(
@@ -240,9 +244,9 @@ def run_dpmd_rf_disease_gnn(
     batch_size: int,
     train_updates: int,
     log_every_n_episodes: int = 10,
-    eval_cooldown_episodes: int = 5,
     results_dir: str = "results",
-) -> Tuple[np.ndarray, DPMDGraphDisease]:
+    run_tag: str = "",
+) -> Tuple[np.ndarray, DPMDGraphDisease, float, int]:
     np.random.seed(seed)
     torch.manual_seed(seed)
 
@@ -325,13 +329,15 @@ def run_dpmd_rf_disease_gnn(
     recent_q_values: List[float] = []
 
     # Training AUC tracking
-    max_training_auc: float = 0.0
-    last_eval_episode: int = -eval_cooldown_episodes  # Allow eval from episode 0
     episode_aucs: List[float] = []
+
+    # Best eval AUC tracking
+    best_eval_auc: float = 0.0
+    best_eval_episode: int = 0
 
     # CSV logging for training AUC
     os.makedirs(results_dir, exist_ok=True)
-    auc_csv_path = f"{results_dir}/training_auc.csv"
+    auc_csv_path = f"{results_dir}/training_auc_{run_tag}.csv"
     with open(auc_csv_path, "w") as f:
         f.write("episode,train_auc,train_auc_MA10,eval_auc\n")
 
@@ -408,35 +414,15 @@ def run_dpmd_rf_disease_gnn(
         episode_rewards.append(ep_reward)
         learner.policy_version += 1
 
-        # Compute moving average of training AUC (for logging and eval trigger)
+        # Compute moving average of training AUC (for logging)
         avg_training_auc = np.mean(episode_aucs[-10:]) if len(episode_aucs) >= 10 else 0.0
 
-        # Check for new max training AUC and run eval if cooldown allows
-        # Only trigger if we have enough episodes for a meaningful moving average
+        # Log training metrics and run eval every log_every_n_episodes
         eval_auc_value = None
-        episodes_since_last_eval = _ep - last_eval_episode
-        if (len(episode_aucs) >= 10 and
-            avg_training_auc > max_training_auc and
-            episodes_since_last_eval >= eval_cooldown_episodes):
-            max_training_auc = avg_training_auc
-            last_eval_episode = _ep
-
-            os.makedirs(results_dir, exist_ok=True)
-            x, y, y_std, traj_rows = evaluate_detection_curve(
-                learner, env, linear_solver, n_episodes_eval=10, gamma=cfg.gamma
-            )
-            eval_auc_value = np.trapezoid(y, x)
-            save_eval_results(x, y, y_std, traj_rows, results_dir, _ep + 1)
-            print(f"  [new max] train_auc_MA10={avg_training_auc:.4f} -> eval_auc={eval_auc_value:.4f}")
-
-        # Append to CSV after each episode (include eval_auc if computed)
-        eval_auc_str = f"{eval_auc_value:.6f}" if eval_auc_value is not None else ""
-        with open(auc_csv_path, "a") as f:
-            f.write(f"{_ep},{ep_auc:.6f},{avg_training_auc:.6f},{eval_auc_str}\n")
-
         if (_ep + 1) % log_every_n_episodes == 0:
             os.makedirs(results_dir, exist_ok=True)
 
+            # Log training metrics first
             avg_reward = np.mean(episode_rewards[-10:]) if episode_rewards else 0.0
             avg_q = np.mean(recent_q_values[-50:]) if recent_q_values else 0.0
             loss_strs = " | ".join(
@@ -448,10 +434,31 @@ def run_dpmd_rf_disease_gnn(
                 + (f" | {loss_strs}" if loss_strs else "")
             )
 
+            # Run eval and log results
+            x, y, y_std, traj_rows = evaluate_detection_curve(
+                learner, env, linear_solver, n_episodes_eval=10, gamma=cfg.gamma
+            )
+            eval_auc_value = np.trapezoid(y, x)
+            save_eval_results(x, y, y_std, traj_rows, results_dir, _ep + 1, run_tag)
+
+            # Track best eval AUC
+            if eval_auc_value > best_eval_auc:
+                best_eval_auc = eval_auc_value
+                best_eval_episode = _ep + 1
+
+            print(f"[{_timestamp()}] [eval] train_auc_MA10={avg_training_auc:.4f} -> eval_auc={eval_auc_value:.4f}")
+
+        # Append to CSV after each episode (include eval_auc if computed)
+        eval_auc_str = f"{eval_auc_value:.6f}" if eval_auc_value is not None else ""
+        with open(auc_csv_path, "a") as f:
+            f.write(f"{_ep},{ep_auc:.6f},{avg_training_auc:.6f},{eval_auc_str}\n")
+
+    best_eval_str = f"best_eval_auc={best_eval_auc:.4f} (ep={best_eval_episode})" if best_eval_episode > 0 else "no_eval"
     print(
         f"[{_timestamp()}] Training complete | total_steps={total_steps} | "
         f"final_avg_reward={np.mean(episode_rewards[-10:]):.4f} | "
-        f"final_train_auc_MA10={np.mean(episode_aucs[-10:]):.4f}"
+        f"final_train_auc_MA10={np.mean(episode_aucs[-10:]):.4f} | "
+        f"{best_eval_str}"
     )
 
     # -------- Greedy eval (no exec noise) --------
@@ -476,4 +483,4 @@ def run_dpmd_rf_disease_gnn(
                 rewards_all.extend([0.0] * (horizon - t - 1))
                 break
 
-    return np.asarray(rewards_all, dtype=np.float32), learner
+    return np.asarray(rewards_all, dtype=np.float32), learner, best_eval_auc, best_eval_episode
