@@ -12,3 +12,8 @@ loss_curves/
 ICPSR_22140/
 ICPSR_22140.pkl
 results_dpmd/
+dpmd_venv/
+logs/
+results/
+results_HIV_100_5/
+results_SRL_HIV_100_5/
