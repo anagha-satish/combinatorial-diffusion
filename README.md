@@ -26,26 +26,26 @@ We use the benchmarks created by [**Xu et al.**](https://arxiv.org/pdf/2503.0191
 3. Dynamic Assignment
 4. Dynamic Interventions
 
-The main benchmark file is `driver_dpmd_rf.py`. The four domains can be run as follows:
+The main benchmark file is `driver_lsflow.py`. The four domains can be run as follows:
 
 1. **Dynamic Scheduling**
 ```
-python driver_dpmd_rf.py --rmab_type scheduling --n_arms 40 --budget 10 --horizon 20
+python driver_lsflow.py --rmab_type scheduling --n_arms 40 --budget 10 --horizon 20
 ```
 
 2. **Dynamic Routing**
 ```
-python driver_dpmd_rf.py --rmab_type routing --n_arms 40 --budget 10 --horizon 20
+python driver_lsflow.py --rmab_type routing --n_arms 40 --budget 10 --horizon 20
 ```
 
 3. **Dynamic Assignment**
 ```
-python driver_dpmd_rf.py --rmab_type constrained --n_arms 40 --budget 10 --horizon 20
+python driver_lsflow.py --rmab_type constrained --n_arms 40 --budget 10 --horizon 20
 ```
 
 4. **Dynamic Interventions**
 ```
-python driver_dpmd_rf.py --rmab_type routing --n_arms 40 --budget 10 --horizon 20 --seed 0
+python driver_lsflow.py --rmab_type routing --n_arms 40 --budget 10 --horizon 20 --seed 0
 ```
 
 Further hyperparameter details can be found in the appendix.
@@ -54,7 +54,7 @@ Further hyperparameter details can be found in the appendix.
 
 We evaluate LSFlow on a real-world sexually transmitted infection (STI) testing class. The data can be accessed at (https://www.icpsr.umich.edu/web/ICPSR/studies/22140). 
 
-Running `driver_disease_dpmd.py` will run this disease experiment. 
+Running `driver_disease_lsflow.py` will run this disease experiment. 
 
 The following options are available:
 
@@ -70,16 +70,16 @@ Further hyperparameter details can be found in the appendix.
 Example commands are as follows
 
 ```
-python driver_disease_dpmd.py --std_name HIV --budget 5 --seed 0
-python driver_disease_dpmd.py --std_name Gonorrhea --budget 5 --seed 0
-python driver_disease_dpmd.py --std_name Chlamydia --budget 5 --seed 0
-python driver_disease_dpmd.py --std_name Syphilis --budget 5 --seed 0
+python driver_disease_lsflow.py --std_name HIV --budget 5 --seed 0
+python driver_disease_lsflow.py --std_name Gonorrhea --budget 5 --seed 0
+python driver_disease_lsflow.py --std_name Chlamydia --budget 5 --seed 0
+python driver_disease_lsflow.py --std_name Syphilis --budget 5 --seed 0
 ```
 
 To load a cached graph
 
 ```
-python driver_disease_dpmd.py --std_name HIV --load_graph_from path/to/cache.pkl
+python driver_disease_lsflow.py --std_name HIV --load_graph_from path/to/cache.pkl
 ```
 
 ## Dependencies
